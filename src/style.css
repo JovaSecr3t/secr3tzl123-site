@@ -393,3 +393,253 @@ button { cursor: pointer; }
     grid-template-columns: 1fr;
   }
 }
+/* UID / 个人 ID / 注册成功提示与密码规则 */
+.uid-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.id-code {
+  font-size: 12px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-muted);
+}
+
+.copy-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.auth-success-box {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.pwd-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-subtle);
+}
+
+.pwd-rules .ok {
+  color: var(--public);
+  font-weight: 600;
+}
+
+/* 独立 /admin 管理控制台风格（双栏布局，与前台毛玻璃卡片区分） */
+.console-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  background: var(--bg-base);
+}
+
+.console-sidebar {
+  background: var(--surface-strong);
+  border-right: 1px solid var(--border-strong);
+  padding: 20px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.console-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.console-logo {
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  background: #0f172a;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.console-brand-title {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.console-brand-sub {
+  font-size: 12px;
+  color: var(--text-subtle);
+}
+
+.console-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.console-nav-item {
+  width: 100%;
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.console-nav-item:hover {
+  background: var(--surface-hover);
+  color: var(--text-main);
+}
+
+.console-nav-item.active {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.console-sidebar-footer {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.console-side-btn {
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.console-side-btn:hover {
+  color: var(--text-main);
+  border-color: var(--border-strong);
+}
+
+.console-side-btn.danger {
+  color: var(--danger);
+  border-color: transparent;
+  background: var(--danger-bg);
+}
+
+.console-main {
+  padding: 24px 28px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+.console-header {
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.console-auth-box {
+  max-width: 440px;
+  width: 100%;
+  margin: 36px auto 0;
+  padding: 24px;
+  border-radius: 14px;
+  background: var(--surface-strong);
+  border: 1px solid var(--border-strong);
+}
+
+.console-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.console-metric-card {
+  padding: 16px 18px;
+  border-radius: 12px;
+  background: var(--surface-strong);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.console-panel {
+  padding: 20px;
+  border-radius: 14px;
+  background: var(--surface-strong);
+  border: 1px solid var(--border);
+}
+
+.console-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.console-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.console-table th,
+.console-table td {
+  text-align: left;
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.console-table th {
+  color: var(--text-subtle);
+  font-weight: 600;
+  background: var(--surface);
+}
+
+@media (max-width: 820px) {
+  .console-shell {
+    grid-template-columns: 1fr;
+  }
+  .console-sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--border-strong);
+  }
+  .console-metrics {
+    grid-template-columns: 1fr;
+  }
+}
