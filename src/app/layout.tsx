@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "secr3tzl123.top",
-  description: "个人博客 · 日常分享 · 登录系统",
+  title: "Secr3tZL's base",
+  description: "Secr3tZL 的个人基地 · 博客文章与日常动态分享",
 };
 
 export default function RootLayout({
@@ -12,10 +12,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="zh-CN">
-      <body className="antialiased bg-slate-950 text-slate-100">
-        {children}
-      </body>
+    <html lang="zh-CN" data-theme="dark">
+      <body>{children}</body>
     </html>
   );
 }

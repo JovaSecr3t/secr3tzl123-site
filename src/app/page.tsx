@@ -1,12 +1,18 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL || "",
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || ""
-);
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
+const isConfigured =
+  Boolean(supabaseUrl) &&
+  Boolean(supabaseAnonKey) &&
+  !supabaseUrl.includes("placeholder");
+
+const supabase: SupabaseClient | null = isConfigured
+  ? createClient(supabaseUrl, supabaseAnonKey)
+  : null;
 
 interface Post {
   id: string;
@@ -24,259 +30,753 @@ interface DailyNote {
   created_at: string;
 }
 
+type TabKey = "home" | "moments" | "blog";
+type ThemeMode = "dark" | "light";
+
+const MOODS = ["日常", "记录", "碎碎念", "推荐"];
+
+function formatTime(iso: string): string {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
+
 export default function HomePage() {
+  const [activeTab, setActiveTab] = useState<TabKey>("home");
+  const [theme, setTheme] = useState<ThemeMode>("dark");
+  const [clockText, setClockText] = useState<string>("--:--:--");
+
+  // 账号状态
   const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [showAuthModal, setShowAuthModal] = useState<boolean>(false);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [emailInput, setEmailInput] = useState<string>("");
   const [passwordInput, setPasswordInput] = useState<string>("");
   const [authMsg, setAuthMsg] = useState<string>("");
+  const [authBusy, setAuthBusy] = useState<boolean>(false);
 
-  const [posts, setPosts] = useState<Post[]>([]);
-  const [title, setTitle] = useState<string>("");
-  const [postContent, setPostContent] = useState<string>("");
-
+  // 数据状态
   const [notes, setNotes] = useState<DailyNote[]>([]);
+  const [posts, setPosts] = useState<Post[]>([]);
+  const [loadingData, setLoadingData] = useState<boolean>(true);
+
+  // 发布动态状态
   const [noteContent, setNoteContent] = useState<string>("");
   const [mood, setMood] = useState<string>("日常");
+  const [publishingNote, setPublishingNote] = useState<boolean>(false);
+
+  // 发布博客状态
+  const [showPostEditor, setShowPostEditor] = useState<boolean>(false);
+  const [postTitle, setPostTitle] = useState<string>("");
+  const [postContent, setPostContent] = useState<string>("");
+  const [publishingPost, setPublishingPost] = useState<boolean>(false);
+  const [readingPost, setReadingPost] = useState<Post | null>(null);
+
+  // 主题初始化
+  useEffect(() => {
+    const saved = localStorage.getItem("secr3tzl_theme");
+    const initial: ThemeMode = saved === "light" ? "light" : "dark";
+    setTheme(initial);
+    document.documentElement.setAttribute("data-theme", initial);
+  }, []);
+
+  function toggleTheme() {
+    const next: ThemeMode = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    document.documentElement.setAttribute("data-theme", next);
+    localStorage.setItem("secr3tzl_theme", next);
+  }
+
+  // 实时时钟
+  useEffect(() => {
+    const updateClock = () => {
+      setClockText(
+        new Date().toLocaleTimeString("zh-CN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        })
+      );
+    };
+    updateClock();
+    const timer = setInterval(updateClock, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // 读取登录状态与数据
+  async function fetchAllData() {
+    if (!supabase) {
+      setLoadingData(false);
+      return;
+    }
+    setLoadingData(true);
+    const [notesRes, postsRes] = await Promise.all([
+      supabase
+        .from("daily_notes")
+        .select("*")
+        .order("created_at", { ascending: false }),
+      supabase
+        .from("posts")
+        .select("*")
+        .order("created_at", { ascending: false }),
+    ]);
+
+    if (!notesRes.error && notesRes.data) {
+      setNotes(notesRes.data as DailyNote[]);
+    }
+    if (!postsRes.error && postsRes.data) {
+      setPosts(postsRes.data as Post[]);
+    }
+    setLoadingData(false);
+  }
 
   useEffect(() => {
-    const url = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
-    if (!url || url.includes("placeholder")) return;
+    fetchAllData();
+    if (!supabase) return;
 
-    supabase.auth.getSession().then(({ data }) => {
-      setUserEmail(data.session?.user?.email ?? null);
+    supabase.auth.getUser().then(({ data }) => {
+      setUserEmail(data.user?.email ?? null);
     });
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUserEmail(session?.user?.email ?? null);
-    });
-    fetchPosts();
-    fetchNotes();
+
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      (_event, session) => {
+        setUserEmail(session?.user?.email ?? null);
+      }
+    );
+
     return () => {
       listener.subscription.unsubscribe();
     };
   }, []);
 
-  async function handleSignUp() {
-    setAuthMsg("");
-    const { error } = await supabase.auth.signUp({
-      email: emailInput,
-      password: passwordInput,
-    });
-    setAuthMsg(error ? error.message : "注册成功！请查收验证邮件或直接登录。");
-  }
-
-  async function handleSignIn() {
-    setAuthMsg("");
-    const { error } = await supabase.auth.signInWithPassword({
-      email: emailInput,
-      password: passwordInput,
-    });
-    setAuthMsg(error ? error.message : "登录成功！");
-  }
-
-  async function handleSignOut() {
-    await supabase.auth.signOut();
-  }
-
-  async function fetchPosts() {
-    const { data } = await supabase
-      .from("posts")
-      .select("*")
-      .order("created_at", { ascending: false });
-    if (data) setPosts(data as Post[]);
-  }
-
-  async function handlePublishPost(e: React.FormEvent<HTMLFormElement>) {
+  // 登录 / 注册
+  async function handleAuthSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (!title.trim() || !postContent.trim()) return;
-    await supabase.from("posts").insert({
-      title,
-      content: postContent,
-      author_email: userEmail ?? "访客",
-    });
-    setTitle("");
-    setPostContent("");
-    fetchPosts();
+    if (!supabase) {
+      setAuthMsg("Supabase 环境变量未配置");
+      return;
+    }
+    if (!emailInput.trim() || !passwordInput.trim()) {
+      setAuthMsg("请输入邮箱和密码");
+      return;
+    }
+    setAuthBusy(true);
+    setAuthMsg("");
+
+    if (authMode === "login") {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: emailInput.trim(),
+        password: passwordInput,
+      });
+      if (error) {
+        setAuthMsg(`登录失败：${error.message}`);
+      } else {
+        setShowAuthModal(false);
+        setPasswordInput("");
+      }
+    } else {
+      const { error } = await supabase.auth.signUp({
+        email: emailInput.trim(),
+        password: passwordInput,
+      });
+      if (error) {
+        setAuthMsg(`注册失败：${error.message}`);
+      } else {
+        setAuthMsg("注册成功！如已关闭邮箱验证，现在可直接登录。");
+        setAuthMode("login");
+      }
+    }
+    setAuthBusy(false);
   }
 
-  async function fetchNotes() {
-    const { data } = await supabase
-      .from("daily_notes")
-      .select("*")
-      .order("created_at", { ascending: false });
-    if (data) setNotes(data as DailyNote[]);
+  async function handleLogout() {
+    if (!supabase) return;
+    await supabase.auth.signOut();
+    setUserEmail(null);
   }
 
+  // 发布日常
   async function handlePublishNote(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (!noteContent.trim()) return;
-    await supabase.from("daily_notes").insert({
-      content: noteContent,
+    if (!supabase || !noteContent.trim()) return;
+    setPublishingNote(true);
+    const { error } = await supabase.from("daily_notes").insert({
+      content: noteContent.trim(),
       mood,
       author_email: userEmail ?? "访客",
     });
-    setNoteContent("");
-    fetchNotes();
+    setPublishingNote(false);
+    if (!error) {
+      setNoteContent("");
+      fetchAllData();
+    }
+  }
+
+  async function handleDeleteNote(id: string) {
+    if (!supabase) return;
+    const { error } = await supabase.from("daily_notes").delete().eq("id", id);
+    if (!error) {
+      setNotes((prev) => prev.filter((item) => item.id !== id));
+    }
+  }
+
+  // 发布博客
+  async function handlePublishPost(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!supabase || !postTitle.trim() || !postContent.trim()) return;
+    setPublishingPost(true);
+    const { error } = await supabase.from("posts").insert({
+      title: postTitle.trim(),
+      content: postContent.trim(),
+      author_email: userEmail ?? "访客",
+    });
+    setPublishingPost(false);
+    if (!error) {
+      setPostTitle("");
+      setPostContent("");
+      setShowPostEditor(false);
+      fetchAllData();
+    }
+  }
+
+  async function handleDeletePost(id: string) {
+    if (!supabase) return;
+    const { error } = await supabase.from("posts").delete().eq("id", id);
+    if (!error) {
+      setPosts((prev) => prev.filter((item) => item.id !== id));
+      if (readingPost?.id === id) setReadingPost(null);
+    }
   }
 
   return (
-    <main className="min-h-screen bg-slate-950 text-slate-100 p-6 max-w-4xl mx-auto space-y-8">
-      <header className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4">
-        <div>
-          <h1 className="text-2xl font-bold">secr3tzl123.top</h1>
-          <p className="text-sm text-slate-400">个人博客 · 日常分享 · 登录系统</p>
-        </div>
-        <div className="text-sm">
-          {userEmail ? (
-            <div className="flex items-center gap-3">
-              <span className="text-emerald-400">{userEmail}</span>
+    <div className="site-wrapper">
+      {/* 顶部悬浮毛玻璃导航 */}
+      <div className="nav-wrap">
+        <header className="glass-nav">
+          <button
+            type="button"
+            className="brand-btn"
+            onClick={() => setActiveTab("home")}
+          >
+            <span className="brand-avatar">ZL</span>
+            <span>Secr3tZL&apos;s base</span>
+          </button>
+
+          <nav className="nav-links" aria-label="主导航">
+            <button
+              type="button"
+              className={`nav-pill ${activeTab === "home" ? "active" : ""}`}
+              onClick={() => setActiveTab("home")}
+            >
+              首页
+            </button>
+            <button
+              type="button"
+              className={`nav-pill ${activeTab === "moments" ? "active" : ""}`}
+              onClick={() => setActiveTab("moments")}
+            >
+              动态 Moments
+            </button>
+            <button
+              type="button"
+              className={`nav-pill ${activeTab === "blog" ? "active" : ""}`}
+              onClick={() => setActiveTab("blog")}
+            >
+              博客 Blog
+            </button>
+          </nav>
+
+          <div className="nav-actions">
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={toggleTheme}
+              title="切换深色/浅色主题"
+            >
+              {theme === "dark" ? "☀️ 浅色" : "🌙 深色"}
+            </button>
+
+            {userEmail ? (
               <button
-                onClick={handleSignOut}
-                className="px-3 py-1 rounded bg-slate-800 hover:bg-slate-700"
+                type="button"
+                className="icon-btn"
+                onClick={handleLogout}
+                title={`当前登录：${userEmail}，点击退出`}
               >
-                退出
+                退出 ({userEmail.split("@")[0]})
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="icon-btn"
+                onClick={() => {
+                  setAuthMsg("");
+                  setShowAuthModal(true);
+                }}
+              >
+                登录 / 注册
+              </button>
+            )}
+          </div>
+        </header>
+      </div>
+
+      {/* 主体内容 */}
+      <main className="main-container">
+        {activeTab === "home" && (
+          <>
+            {/* 个人基地 Hero + 状态卡片 */}
+            <section className="hero-grid">
+              <div className="glass-card hero-main">
+                <div className="hero-profile">
+                  <div className="hero-avatar">ZL</div>
+                  <div>
+                    <h1 className="hero-title">Secr3tZL&apos;s base</h1>
+                    <p className="hero-subtitle">
+                      记录日常碎碎念、折腾技术与博客文章的个人小站
+                    </p>
+                  </div>
+                </div>
+
+                <div className="tag-row">
+                  <span className="tag-chip">
+                    <span className="status-dot" />
+                    站点运行中
+                  </span>
+                  <span className="tag-chip">secr3tzl123.top</span>
+                  <span className="tag-chip">Next.js · Supabase</span>
+                </div>
+              </div>
+
+              <div className="glass-card bento-side">
+                <div className="clock-box">
+                  <div className="clock-label">当前本地时间</div>
+                  <div className="clock-time">{clockText}</div>
+                </div>
+
+                <div className="stats-row">
+                  <div className="stat-card">
+                    <div className="stat-num">{notes.length}</div>
+                    <div className="stat-label">日常动态</div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="stat-num">{posts.length}</div>
+                    <div className="stat-label">博客文章</div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            {/* 最新动态预览 */}
+            <section className="glass-card">
+              <div className="section-header">
+                <h2 className="section-title">最新动态 · Moments</h2>
+                <button
+                  type="button"
+                  className="link-btn"
+                  onClick={() => setActiveTab("moments")}
+                >
+                  查看全部 / 发布 →
+                </button>
+              </div>
+
+              {loadingData ? (
+                <div className="empty-state">加载中...</div>
+              ) : notes.length === 0 ? (
+                <div className="empty-state">还没有动态，去发布第一条吧~</div>
+              ) : (
+                <div className="feed-list">
+                  {notes.slice(0, 3).map((note) => (
+                    <div key={note.id} className="moment-card">
+                      <div className="card-meta">
+                        <span className="mood-badge">
+                          {note.mood || "日常"}
+                        </span>
+                        <span>{formatTime(note.created_at)}</span>
+                      </div>
+                      <p className="card-text">{note.content}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+
+            {/* 最新博客预览 */}
+            <section className="glass-card">
+              <div className="section-header">
+                <h2 className="section-title">精选博客 · Blog</h2>
+                <button
+                  type="button"
+                  className="link-btn"
+                  onClick={() => setActiveTab("blog")}
+                >
+                  全部文章 / 写文章 →
+                </button>
+              </div>
+
+              {loadingData ? (
+                <div className="empty-state">加载中...</div>
+              ) : posts.length === 0 ? (
+                <div className="empty-state">还没有博客文章，去写第一篇吧~</div>
+              ) : (
+                <div className="blog-grid">
+                  {posts.slice(0, 4).map((post) => (
+                    <article
+                      key={post.id}
+                      className="blog-card"
+                      onClick={() => setReadingPost(post)}
+                    >
+                      <div>
+                        <h3 className="blog-title">{post.title}</h3>
+                        <p className="blog-excerpt" style={{ marginTop: 8 }}>
+                          {post.content}
+                        </p>
+                      </div>
+                      <div className="card-meta">
+                        <span>{post.author_email || "站长"}</span>
+                        <span>{formatTime(post.created_at)}</span>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+          </>
+        )}
+
+        {activeTab === "moments" && (
+          <section className="glass-card">
+            <div className="section-header">
+              <h2 className="section-title">分享日常 · Moments</h2>
+              <span style={{ fontSize: 13, color: "var(--text-subtle)" }}>
+                共 {notes.length} 条记录
+              </span>
+            </div>
+
+            {userEmail ? (
+              <form onSubmit={handlePublishNote} className="composer-form">
+                <textarea
+                  className="field-textarea"
+                  style={{ minHeight: 84 }}
+                  placeholder="此刻在想什么？记录一条今天的日常..."
+                  value={noteContent}
+                  onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) =>
+                    setNoteContent(e.target.value)
+                  }
+                />
+                <div className="mood-bar">
+                  <div className="mood-pills">
+                    {MOODS.map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        className={`mood-pill ${mood === m ? "active" : ""}`}
+                        onClick={() => setMood(m)}
+                      >
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                  <button
+                    type="submit"
+                    className="btn-primary"
+                    disabled={publishingNote || !noteContent.trim()}
+                  >
+                    {publishingNote ? "发布中..." : "发布动态"}
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <div className="notice-bar" style={{ marginBottom: 20 }}>
+                <span>登录后即可发布新的日常动态</span>
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={() => setShowAuthModal(true)}
+                >
+                  立即登录
+                </button>
+              </div>
+            )}
+
+            <div className="feed-list">
+              {notes.length === 0 ? (
+                <div className="empty-state">暂无动态</div>
+              ) : (
+                notes.map((note) => (
+                  <div key={note.id} className="moment-card">
+                    <div className="card-meta">
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <span className="mood-badge">{note.mood || "日常"}</span>
+                        <span>{note.author_email || "站长"}</span>
+                      </div>
+                      <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                        <span>{formatTime(note.created_at)}</span>
+                        {userEmail && userEmail === note.author_email && (
+                          <button
+                            type="button"
+                            className="btn-danger-sm"
+                            onClick={() => handleDeleteNote(note.id)}
+                          >
+                            删除
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <p className="card-text">{note.content}</p>
+                  </div>
+                ))
+              )}
+            </div>
+          </section>
+        )}
+
+        {activeTab === "blog" && (
+          <section className="glass-card">
+            <div className="section-header">
+              <h2 className="section-title">博客文章 · Blog</h2>
+              {userEmail ? (
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={() => setShowPostEditor((v) => !v)}
+                >
+                  {showPostEditor ? "收起编辑器" : "+ 写新文章"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={() => setShowAuthModal(true)}
+                >
+                  登录后写文章
+                </button>
+              )}
+            </div>
+
+            {userEmail && showPostEditor && (
+              <form onSubmit={handlePublishPost} className="composer-form">
+                <input
+                  type="text"
+                  className="field-input"
+                  placeholder="输入文章标题..."
+                  value={postTitle}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    setPostTitle(e.target.value)
+                  }
+                />
+                <textarea
+                  className="field-textarea"
+                  style={{ minHeight: 180 }}
+                  placeholder="写下你的博客正文..."
+                  value={postContent}
+                  onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) =>
+                    setPostContent(e.target.value)
+                  }
+                />
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    onClick={() => setShowPostEditor(false)}
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn-primary"
+                    disabled={
+                      publishingPost || !postTitle.trim() || !postContent.trim()
+                    }
+                  >
+                    {publishingPost ? "发布中..." : "发布文章"}
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {posts.length === 0 ? (
+              <div className="empty-state">暂无博客文章</div>
+            ) : (
+              <div className="blog-grid">
+                {posts.map((post) => (
+                  <article
+                    key={post.id}
+                    className="blog-card"
+                    onClick={() => setReadingPost(post)}
+                  >
+                    <div>
+                      <h3 className="blog-title">{post.title}</h3>
+                      <p className="blog-excerpt" style={{ marginTop: 8 }}>
+                        {post.content}
+                      </p>
+                    </div>
+                    <div className="card-meta">
+                      <span>{formatTime(post.created_at)}</span>
+                      {userEmail && userEmail === post.author_email && (
+                        <button
+                          type="button"
+                          className="btn-danger-sm"
+                          onClick={(e: React.MouseEvent<HTMLButtonElement>) => {
+                            e.stopPropagation();
+                            handleDeletePost(post.id);
+                          }}
+                        >
+                          删除
+                        </button>
+                      )}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+      </main>
+
+      {/* 页脚 */}
+      <footer className="site-footer">
+        <p>
+          © 2026 Secr3tZL&apos;s base · Cloudflare Pages 提供静态部署服务 ·
+          Supabase 驱动数据与账号
+        </p>
+      </footer>
+
+      {/* 登录 / 注册弹窗 */}
+      {showAuthModal && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setShowAuthModal(false)}
+        >
+          <div
+            className="modal-box"
+            onClick={(e: React.MouseEvent<HTMLDivElement>) =>
+              e.stopPropagation()
+            }
+          >
+            <div className="section-header" style={{ marginBottom: 0 }}>
+              <h3 className="section-title">账号中心</h3>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => setShowAuthModal(false)}
+              >
+                关闭
               </button>
             </div>
-          ) : (
-            <span className="text-slate-400">未登录</span>
-          )}
-        </div>
-      </header>
 
-      {!userEmail && (
-        <section className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
-          <h2 className="text-lg font-semibold">用户登录 / 注册</h2>
-          <div className="flex flex-wrap gap-2">
-            <input
-              type="email"
-              placeholder="邮箱"
-              value={emailInput}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                setEmailInput(e.target.value)
-              }
-              className="px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
-            />
-            <input
-              type="password"
-              placeholder="密码（至少6位）"
-              value={passwordInput}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                setPasswordInput(e.target.value)
-              }
-              className="px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
-            />
-            <button
-              onClick={handleSignIn}
-              className="px-4 py-2 rounded bg-blue-600 hover:bg-blue-500 text-sm font-medium"
+            <div className="modal-tabs">
+              <button
+                type="button"
+                className={`modal-tab ${authMode === "login" ? "active" : ""}`}
+                onClick={() => {
+                  setAuthMode("login");
+                  setAuthMsg("");
+                }}
+              >
+                立即登录
+              </button>
+              <button
+                type="button"
+                className={`modal-tab ${authMode === "register" ? "active" : ""}`}
+                onClick={() => {
+                  setAuthMode("register");
+                  setAuthMsg("");
+                }}
+              >
+                注册账号
+              </button>
+            </div>
+
+            <form
+              onSubmit={handleAuthSubmit}
+              style={{ display: "flex", flexDirection: "column", gap: 12 }}
             >
-              登录
-            </button>
-            <button
-              onClick={handleSignUp}
-              className="px-4 py-2 rounded bg-slate-700 hover:bg-slate-600 text-sm font-medium"
-            >
-              注册
-            </button>
+              <input
+                type="email"
+                className="field-input"
+                placeholder="邮箱地址"
+                value={emailInput}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  setEmailInput(e.target.value)
+                }
+              />
+              <input
+                type="password"
+                className="field-input"
+                placeholder="密码（至少 6 位）"
+                value={passwordInput}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  setPasswordInput(e.target.value)
+                }
+              />
+              {authMsg && <p className="auth-msg">{authMsg}</p>}
+              <button
+                type="submit"
+                className="btn-primary"
+                disabled={authBusy}
+              >
+                {authBusy
+                  ? "处理中..."
+                  : authMode === "login"
+                  ? "立即登录"
+                  : "创建账号"}
+              </button>
+            </form>
           </div>
-          {authMsg && <p className="text-sm text-amber-300">{authMsg}</p>}
-        </section>
+        </div>
       )}
 
-      <section className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-        <h2 className="text-lg font-semibold">分享日常</h2>
-        <form onSubmit={handlePublishNote} className="space-y-3">
-          <div className="flex flex-wrap gap-2">
-            <select
-              value={mood}
-              onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
-                setMood(e.target.value)
-              }
-              className="px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
-            >
-              <option value="日常">日常</option>
-              <option value="记录">记录</option>
-              <option value="碎碎念">碎碎念</option>
-              <option value="推荐">推荐</option>
-            </select>
-            <input
-              type="text"
-              placeholder="发一条今天的日常..."
-              value={noteContent}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                setNoteContent(e.target.value)
-              }
-              className="flex-1 min-w-[220px] px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
-            />
-            <button
-              type="submit"
-              className="px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-500 text-sm font-medium"
-            >
-              发日常
-            </button>
-          </div>
-        </form>
-
-        <div className="space-y-2 pt-1">
-          {notes.map((note) => (
-            <div
-              key={note.id}
-              className="border border-slate-800 rounded-lg px-4 py-3 bg-slate-950/60 flex flex-col gap-1"
-            >
-              <div className="flex items-center justify-between text-xs text-slate-400">
-                <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-200">
-                  {note.mood ?? "日常"}
-                </span>
-                <span>{note.author_email ?? "访客"}</span>
-              </div>
-              <p className="text-sm text-slate-200 whitespace-pre-wrap">{note.content}</p>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-        <h2 className="text-lg font-semibold">博客文章</h2>
-        <form onSubmit={handlePublishPost} className="space-y-3">
-          <input
-            type="text"
-            placeholder="文章标题"
-            value={title}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-              setTitle(e.target.value)
+      {/* 文章全文阅读弹窗 */}
+      {readingPost && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setReadingPost(null)}
+        >
+          <div
+            className="modal-box modal-wide"
+            onClick={(e: React.MouseEvent<HTMLDivElement>) =>
+              e.stopPropagation()
             }
-            className="w-full px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
-          />
-          <textarea
-            rows={4}
-            placeholder="写一篇博客..."
-            value={postContent}
-            onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) =>
-              setPostContent(e.target.value)
-            }
-            className="w-full px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
-          />
-          <button
-            type="submit"
-            className="px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-medium"
           >
-            发布文章
-          </button>
-        </form>
-
-        <div className="space-y-3 pt-2">
-          {posts.map((post) => (
-            <article
-              key={post.id}
-              className="border border-slate-800 rounded-lg p-4 bg-slate-950/60 space-y-1"
+            <div className="section-header" style={{ marginBottom: 0 }}>
+              <h2 className="section-title" style={{ fontSize: 22 }}>
+                {readingPost.title}
+              </h2>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => setReadingPost(null)}
+              >
+                关闭
+              </button>
+            </div>
+            <div className="card-meta">
+              <span>作者：{readingPost.author_email || "站长"}</span>
+              <span>发布于 {formatTime(readingPost.created_at)}</span>
+            </div>
+            <div
+              className="card-text"
+              style={{
+                paddingTop: 12,
+                borderTop: "1px solid var(--border)",
+                lineHeight: 1.85,
+              }}
             >
-              <h3 className="font-semibold text-base">{post.title}</h3>
-              <p className="text-sm text-slate-300 whitespace-pre-wrap">{post.content}</p>
-              <p className="text-xs text-slate-500">
-                作者：{post.author_email ?? "访客"}
-              </p>
-            </article>
-          ))}
+              {readingPost.content}
+            </div>
+          </div>
         </div>
-      </section>
-    </main>
+      )}
+    </div>
   );
 }
