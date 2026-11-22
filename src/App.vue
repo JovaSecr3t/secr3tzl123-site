@@ -5,18 +5,39 @@ const MOODS = ["日常", "记录", "碎碎念", "推荐"];
 const TOKEN_KEY = "secr3tzl_d1_token";
 
 const activeTab = ref("home");
+const isAdminRoute = ref(
+  window.location.pathname.replace(/\/+$/, "") === "/admin"
+);
 const theme = ref("dark");
 const clockText = ref("--:--:--");
 const toastMsg = ref("");
 
 // 账号状态
+const userId = ref(null);
 const userEmail = ref(null);
+const userName = ref("");
+const userRole = ref("user");
 const showAuthModal = ref(false);
 const authMode = ref("login");
+const accountInput = ref("");
+const usernameInput = ref("");
 const emailInput = ref("");
 const passwordInput = ref("");
+const confirmPasswordInput = ref("");
 const authMsg = ref("");
 const authBusy = ref(false);
+
+// 管理员后台与用户中心状态
+const hasAdminAccount = ref(true);
+const checkingAdminStatus = ref(false);
+const adminEmailInput = ref("");
+const adminPasswordInput = ref("");
+const adminConfirmPasswordInput = ref("");
+const profileNameInput = ref("");
+const savingProfile = ref(false);
+const adminUsers = ref([]);
+const adminTotalUsers = ref(0);
+const loadingAdmin = ref(false);
 
 // 数据状态
 const posts = ref([]);
@@ -37,19 +58,42 @@ const postIsPublic = ref(true);
 const publishingPost = ref(false);
 const readingPost = ref(null);
 
-// 计算分区列表
+const isLoggedIn = computed(() => Boolean(userId.value));
+const isAdmin = computed(() => userRole.value === "admin");
+const displayCurrentUser = computed(() => {
+  if (!isLoggedIn.value) return "访客";
+  return userName.value || getDisplayName(userEmail.value);
+});
+
 const publicPosts = computed(() => posts.value.filter((p) => p.is_public));
 const privatePosts = computed(() =>
-  posts.value.filter(
-    (p) => !p.is_public && userEmail.value && p.author_email === userEmail.value
-  )
+  posts.value.filter((p) => !p.is_public && p.is_mine)
 );
 const publicNotes = computed(() => notes.value.filter((n) => n.is_public));
 const privateNotes = computed(() =>
-  notes.value.filter(
-    (n) => !n.is_public && userEmail.value && n.author_email === userEmail.value
-  )
+  notes.value.filter((n) => !n.is_public && n.is_mine)
 );
+
+// 实时密码规则校验（前台注册 & /admin 注册共用）
+function getPasswordChecks(pwd) {
+  return {
+    len: pwd.length >= 8,
+    upper: /[A-Z]/.test(pwd),
+    digit: /\d/.test(pwd),
+  };
+}
+
+function validatePasswordClient(pwd, confirmPwd) {
+  const c = getPasswordChecks(pwd);
+  if (!c.len) return "密码长度至少需要 8 位";
+  if (!c.upper) return "密码必须包含至少 1 个大写字母";
+  if (!c.digit) return "密码必须包含至少 1 个数字";
+  if (pwd !== confirmPwd) return "两次输入的密码不一致";
+  return "";
+}
+
+const regPwdChecks = computed(() => getPasswordChecks(passwordInput.value));
+const adminPwdChecks = computed(() => getPasswordChecks(adminPasswordInput.value));
 
 function showNotice(msg) {
   toastMsg.value = msg;
@@ -72,13 +116,13 @@ function formatTime(iso) {
   }
 }
 
-function getDisplayName(email) {
-  if (!email) return "站长";
-  return email.includes("@") ? email.split("@")[0] : email;
+function getDisplayName(nameOrEmail) {
+  if (!nameOrEmail) return "用户";
+  return nameOrEmail.includes("@") ? nameOrEmail.split("@")[0] : nameOrEmail;
 }
 
-function getInitials(email) {
-  return getDisplayName(email).slice(0, 2).toUpperCase();
+function getInitials(nameOrEmail) {
+  return getDisplayName(nameOrEmail).slice(0, 2).toUpperCase();
 }
 
 async function apiFetch(path, init = {}) {
@@ -95,6 +139,35 @@ async function apiFetch(path, init = {}) {
     throw new Error(data.error || `请求失败 (${res.status})`);
   }
   return data;
+}
+
+async function fetchAdminStatus() {
+  checkingAdminStatus.value = true;
+  try {
+    const res = await apiFetch("/api/admin/status");
+    hasAdminAccount.value = Boolean(res.hasAdmin);
+  } catch {
+    hasAdminAccount.value = true;
+  } finally {
+    checkingAdminStatus.value = false;
+  }
+}
+
+function syncRoute() {
+  isAdminRoute.value =
+    window.location.pathname.replace(/\/+$/, "") === "/admin";
+  authMsg.value = "";
+  if (isAdminRoute.value) {
+    fetchAdminStatus();
+    if (isAdmin.value) fetchAdminUsers();
+  }
+}
+
+function goToPath(path) {
+  if (window.location.pathname !== path) {
+    window.history.pushState({}, "", path);
+  }
+  syncRoute();
 }
 
 async function fetchAllData() {
@@ -116,15 +189,25 @@ async function fetchAllData() {
 async function checkSession() {
   const token = localStorage.getItem(TOKEN_KEY);
   if (!token) {
+    userId.value = null;
     userEmail.value = null;
+    userName.value = "";
+    userRole.value = "user";
     return;
   }
   try {
     const res = await apiFetch("/api/auth/me");
-    userEmail.value = res.email;
-    if (!res.email) localStorage.removeItem(TOKEN_KEY);
+    userId.value = res.id || null;
+    userEmail.value = res.email || null;
+    userName.value = res.username || "";
+    userRole.value = res.role || "user";
+    profileNameInput.value = userName.value;
+    if (!res.id) localStorage.removeItem(TOKEN_KEY);
   } catch {
+    userId.value = null;
     userEmail.value = null;
+    userName.value = "";
+    userRole.value = "user";
     localStorage.removeItem(TOKEN_KEY);
   }
 }
@@ -136,7 +219,7 @@ function toggleTheme() {
 }
 
 function openUploadBlog(defaultPublic = true) {
-  if (!userEmail.value) {
+  if (!isLoggedIn.value) {
     authMsg.value = "请先登录后再上传博客";
     showAuthModal.value = true;
     return;
@@ -146,28 +229,62 @@ function openUploadBlog(defaultPublic = true) {
 }
 
 async function handleAuthSubmit() {
-  if (!emailInput.value.trim() || !passwordInput.value) {
-    authMsg.value = "请输入邮箱和密码";
-    return;
+  if (authMode.value === "login") {
+    if (!accountInput.value.trim() || !passwordInput.value) {
+      authMsg.value = "请输入用户名（或邮箱）和密码";
+      return;
+    }
+  } else {
+    const name = usernameInput.value.trim();
+    if (!name || name.length < 2 || name.length > 20 || /\s/.test(name)) {
+      authMsg.value = "用户名需为 2~20 位非空格字符";
+      return;
+    }
+    const pwdErr = validatePasswordClient(
+      passwordInput.value,
+      confirmPasswordInput.value
+    );
+    if (pwdErr) {
+      authMsg.value = pwdErr;
+      return;
+    }
   }
+
   authBusy.value = true;
   authMsg.value = "";
   try {
     const endpoint =
       authMode.value === "login" ? "/api/auth/login" : "/api/auth/register";
+    const payload =
+      authMode.value === "login"
+        ? {
+            account: accountInput.value.trim(),
+            password: passwordInput.value,
+          }
+        : {
+            username: usernameInput.value.trim(),
+            email: emailInput.value.trim() || undefined,
+            password: passwordInput.value,
+          };
+
     const res = await apiFetch(endpoint, {
       method: "POST",
-      body: JSON.stringify({
-        email: emailInput.value.trim(),
-        password: passwordInput.value,
-      }),
+      body: JSON.stringify(payload),
     });
     localStorage.setItem(TOKEN_KEY, res.token);
-    userEmail.value = res.email;
+    userId.value = res.id;
+    userName.value = res.username;
+    userEmail.value = res.email || null;
+    userRole.value = res.role || "user";
+    profileNameInput.value = userName.value;
     showAuthModal.value = false;
     passwordInput.value = "";
+    confirmPasswordInput.value = "";
     showNotice(authMode.value === "login" ? "登录成功" : "注册并登录成功");
     await fetchAllData();
+    if (isAdminRoute.value && isAdmin.value) {
+      await fetchAdminUsers();
+    }
   } catch (err) {
     authMsg.value = err?.message || "操作失败";
   } finally {
@@ -175,10 +292,59 @@ async function handleAuthSubmit() {
   }
 }
 
+async function handleAdminLogin() {
+  authMode.value = "login";
+  await handleAuthSubmit();
+}
+
+async function handleAdminRegister() {
+  const pwdErr = validatePasswordClient(
+    adminPasswordInput.value,
+    adminConfirmPasswordInput.value
+  );
+  if (pwdErr) {
+    authMsg.value = pwdErr;
+    return;
+  }
+
+  authBusy.value = true;
+  authMsg.value = "";
+  try {
+    const res = await apiFetch("/api/admin/register", {
+      method: "POST",
+      body: JSON.stringify({
+        email: adminEmailInput.value.trim() || undefined,
+        password: adminPasswordInput.value,
+      }),
+    });
+    localStorage.setItem(TOKEN_KEY, res.token);
+    userId.value = res.id;
+    userName.value = res.username;
+    userEmail.value = res.email || null;
+    userRole.value = res.role || "admin";
+    profileNameInput.value = userName.value;
+    hasAdminAccount.value = true;
+    adminPasswordInput.value = "";
+    adminConfirmPasswordInput.value = "";
+    showNotice("管理员 admin 初始化注册成功");
+    await Promise.all([fetchAllData(), fetchAdminUsers()]);
+  } catch (err) {
+    authMsg.value = err?.message || "注册管理员失败";
+  } finally {
+    authBusy.value = false;
+  }
+}
+
 async function handleLogout() {
   localStorage.removeItem(TOKEN_KEY);
+  userId.value = null;
   userEmail.value = null;
-  if (activeTab.value === "private_space") activeTab.value = "home";
+  userName.value = "";
+  userRole.value = "user";
+  profileNameInput.value = "";
+  if (["private_space", "profile"].includes(activeTab.value)) {
+    activeTab.value = "home";
+  }
   showNotice("已退出登录");
   await fetchAllData();
 }
@@ -282,6 +448,60 @@ async function handleDeleteNote(id) {
   }
 }
 
+async function handleUpdateUsername() {
+  const nextName = profileNameInput.value.trim();
+  if (!nextName || nextName.length < 2 || nextName.length > 20 || /\s/.test(nextName)) {
+    showNotice("用户名需为 2~20 位非空格字符");
+    return;
+  }
+  savingProfile.value = true;
+  try {
+    const res = await apiFetch("/api/user/profile", {
+      method: "PATCH",
+      body: JSON.stringify({ username: nextName }),
+    });
+    userName.value = res.username;
+    showNotice("用户名已更新");
+    await fetchAllData();
+  } catch (err) {
+    showNotice(err?.message || "更新用户名失败");
+  } finally {
+    savingProfile.value = false;
+  }
+}
+
+async function fetchAdminUsers() {
+  if (!isAdmin.value) return;
+  loadingAdmin.value = true;
+  try {
+    const res = await apiFetch("/api/admin/users");
+    adminTotalUsers.value = res.total || 0;
+    adminUsers.value = res.users || [];
+  } catch (err) {
+    showNotice(err?.message || "获取用户列表失败");
+  } finally {
+    loadingAdmin.value = false;
+  }
+}
+
+async function handleToggleUserRole(targetUser) {
+  const nextRole = targetUser.role === "admin" ? "user" : "admin";
+  try {
+    await apiFetch(`/api/admin/users/${targetUser.id}/role`, {
+      method: "PATCH",
+      body: JSON.stringify({ role: nextRole }),
+    });
+    targetUser.role = nextRole;
+    showNotice(
+      nextRole === "admin"
+        ? `已将 ${targetUser.username} 设为管理员`
+        : `已取消 ${targetUser.username} 的管理员权限`
+    );
+  } catch (err) {
+    showNotice(err?.message || "权限修改失败");
+  }
+}
+
 let timer = null;
 onMounted(async () => {
   const saved = localStorage.getItem("secr3tzl_theme");
@@ -298,23 +518,265 @@ onMounted(async () => {
   updateClock();
   timer = window.setInterval(updateClock, 1000);
 
+  window.addEventListener("popstate", syncRoute);
   await checkSession();
   await fetchAllData();
+  if (isAdminRoute.value) {
+    await fetchAdminStatus();
+    if (isAdmin.value) await fetchAdminUsers();
+  }
 });
 
 onUnmounted(() => {
   if (timer) window.clearInterval(timer);
+  window.removeEventListener("popstate", syncRoute);
 });
 </script>
 
 <template>
-  <div class="site-wrapper">
-    <!-- 顶部悬浮毛玻璃导航 -->
+  <!-- 独立路径 /admin 管理员后台 -->
+  <div v-if="isAdminRoute" class="admin-page-wrap">
+    <header class="glass-card admin-topbar">
+      <div class="row-gap">
+        <span class="brand-avatar">🛡️</span>
+        <div>
+          <h1 style="font-size: 18px; font-weight: 700">后台管理系统</h1>
+          <p class="card-meta">独立管理入口 · /admin</p>
+        </div>
+      </div>
+
+      <div class="row-gap">
+        <button type="button" class="icon-btn" @click="toggleTheme">
+          {{ theme === "dark" ? "☀️" : "🌙" }}
+        </button>
+        <button type="button" class="icon-btn" @click="goToPath('/')">
+          返回前台首页
+        </button>
+        <button
+          v-if="isLoggedIn"
+          type="button"
+          class="btn-danger-sm"
+          @click="handleLogout"
+        >
+          退出 ({{ displayCurrentUser }})
+        </button>
+      </div>
+    </header>
+
+    <div v-if="toastMsg" class="notice-bar">
+      <span>{{ toastMsg }}</span>
+    </div>
+
+    <!-- 情况 1：未登录 -->
+    <section v-if="!isLoggedIn" class="glass-card admin-login-card">
+      <div v-if="checkingAdminStatus" class="empty-state">检查后台初始化状态...</div>
+
+      <!-- 1A：尚未注册过 admin -> 显示初始化注册 admin 表单 -->
+      <template v-else-if="!hasAdminAccount">
+        <h2 class="section-title">初始化注册管理员</h2>
+        <p class="section-sub" style="margin: 4px 0 16px">
+          检测到系统尚未创建默认管理员，请先完成 <strong>admin</strong> 账号注册
+        </p>
+
+        <form class="col-gap" @submit.prevent="handleAdminRegister">
+          <input
+            type="text"
+            class="field-input"
+            value="admin"
+            disabled
+          />
+          <input
+            v-model="adminEmailInput"
+            type="email"
+            class="field-input"
+            placeholder="管理员邮箱（选填，可作为备用登录方式）"
+          />
+          <input
+            v-model="adminPasswordInput"
+            type="password"
+            class="field-input"
+            placeholder="设置管理员密码（至少 8 位，含大写字母和数字）"
+          />
+          <input
+            v-model="adminConfirmPasswordInput"
+            type="password"
+            class="field-input"
+            placeholder="再次输入密码确认"
+          />
+
+          <div class="pwd-rules">
+            <span :class="{ ok: adminPwdChecks.len }">
+              {{ adminPwdChecks.len ? "✓" : "○" }} 至少 8 位字符
+            </span>
+            <span :class="{ ok: adminPwdChecks.upper }">
+              {{ adminPwdChecks.upper ? "✓" : "○" }} 至少 1 个大写字母 (A-Z)
+            </span>
+            <span :class="{ ok: adminPwdChecks.digit }">
+              {{ adminPwdChecks.digit ? "✓" : "○" }} 至少 1 个数字 (0-9)
+            </span>
+          </div>
+
+          <p v-if="authMsg" class="auth-msg">{{ authMsg }}</p>
+          <button type="submit" class="btn-primary" :disabled="authBusy">
+            {{ authBusy ? "注册中..." : "注册 admin 并进入后台" }}
+          </button>
+        </form>
+      </template>
+
+      <!-- 1B：已注册 admin -> 显示管理员登录表单 -->
+      <template v-else>
+        <h2 class="section-title">管理员登录</h2>
+        <p class="section-sub" style="margin: 4px 0 16px">
+          请使用 admin 或已被授权的管理员账号登录后台
+        </p>
+
+        <form class="col-gap" @submit.prevent="handleAdminLogin">
+          <input
+            v-model="accountInput"
+            type="text"
+            class="field-input"
+            placeholder="管理员用户名或邮箱（如：admin）"
+          />
+          <input
+            v-model="passwordInput"
+            type="password"
+            class="field-input"
+            placeholder="密码"
+          />
+          <p v-if="authMsg" class="auth-msg">{{ authMsg }}</p>
+          <button type="submit" class="btn-primary" :disabled="authBusy">
+            {{ authBusy ? "登录中..." : "登录后台" }}
+          </button>
+        </form>
+      </template>
+    </section>
+
+    <!-- 情况 2：已登录但不是管理员 -->
+    <section v-else-if="!isAdmin" class="glass-card admin-login-card">
+      <h2 class="section-title">无访问权限</h2>
+      <p class="section-sub" style="margin: 8px 0 18px">
+        当前登录账号（{{ displayCurrentUser }}）不是管理员，无法进入后台。
+      </p>
+      <div class="row-gap">
+        <button type="button" class="btn-primary" @click="handleLogout">
+          切换管理员账号
+        </button>
+        <button type="button" class="btn-ghost" @click="goToPath('/')">
+          返回前台首页
+        </button>
+      </div>
+    </section>
+
+    <!-- 情况 3：管理员已登录 -> 后台管理面板 -->
+    <template v-else>
+      <section class="glass-card">
+        <div class="section-header">
+          <div>
+            <h2 class="section-title">用户与权限管理</h2>
+            <p class="section-sub">统计用户总数，并给指定用户授予或取消管理员权限</p>
+          </div>
+          <button type="button" class="btn-mini" @click="fetchAdminUsers">
+            刷新用户数据
+          </button>
+        </div>
+
+        <div class="admin-summary">
+          <div class="stat-card">
+            <div class="stat-num">{{ adminTotalUsers }}</div>
+            <div class="stat-label">当前用户总数</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-num">
+              {{ adminUsers.filter((u) => u.role === "admin").length }}
+            </div>
+            <div class="stat-label">管理员人数</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-num">{{ publicPosts.length }}</div>
+            <div class="stat-label">公共博客数</div>
+          </div>
+        </div>
+
+        <div v-if="loadingAdmin" class="empty-state">加载用户列表中...</div>
+        <div v-else class="feed-list">
+          <div v-for="u in adminUsers" :key="u.id" class="admin-user-row">
+            <div>
+              <div class="row-gap">
+                <strong>{{ u.username }}</strong>
+                <span
+                  class="vis-badge"
+                  :class="u.role === 'admin' ? 'public' : 'private'"
+                >
+                  {{ u.role === "admin" ? "管理员" : "普通用户" }}
+                </span>
+              </div>
+              <div class="card-meta" style="margin-top: 4px">
+                <span>{{ u.email || "未绑定邮箱" }}</span>
+                <span>注册于 {{ formatTime(u.created_at) }}</span>
+              </div>
+            </div>
+
+            <button
+              v-if="u.id !== userId && u.id !== 'root-admin'"
+              type="button"
+              :class="u.role === 'admin' ? 'btn-danger-sm' : 'btn-primary'"
+              @click="handleToggleUserRole(u)"
+            >
+              {{ u.role === "admin" ? "取消管理员" : "设为管理员" }}
+            </button>
+            <span v-else class="card-meta">
+              {{ u.id === "root-admin" ? "默认管理员" : "当前账号" }}
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <section class="glass-card">
+        <div class="section-header">
+          <div>
+            <h2 class="section-title">公共博客审核管理</h2>
+            <p class="section-sub">可直接在此查看或删除公共博客区中的违规文章</p>
+          </div>
+          <button type="button" class="btn-mini" @click="fetchAllData">
+            刷新文章
+          </button>
+        </div>
+
+        <div v-if="publicPosts.length === 0" class="empty-state">暂无公共博客</div>
+        <div v-else class="feed-list">
+          <div v-for="post in publicPosts" :key="post.id" class="admin-user-row">
+            <div style="flex: 1; min-width: 220px">
+              <strong>{{ post.title }}</strong>
+              <div class="card-meta" style="margin-top: 4px">
+                <span>作者：{{ post.author_name || getDisplayName(post.author_email) }}</span>
+                <span>{{ formatTime(post.created_at) }}</span>
+              </div>
+            </div>
+            <div class="row-gap">
+              <button type="button" class="btn-mini" @click="readingPost = post">
+                查看
+              </button>
+              <button
+                type="button"
+                class="btn-danger-sm"
+                @click="handleDeletePost(post.id)"
+              >
+                删除违规
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </template>
+  </div>
+
+  <!-- 前台主站点 -->
+  <div v-else class="site-wrapper">
     <div class="nav-wrap">
       <header class="glass-nav">
         <button type="button" class="brand-btn" @click="activeTab = 'home'">
-          <span class="brand-avatar">ZL</span>
-          <span>Secr3tZL's base</span>
+          <span class="brand-avatar">{{ getInitials(displayCurrentUser) }}</span>
+          <span>欢迎您，{{ displayCurrentUser }}</span>
         </button>
 
         <nav class="nav-links" aria-label="主导航">
@@ -350,6 +812,23 @@ onUnmounted(() => {
           >
             🔒 私密空间
           </button>
+          <button
+            v-if="isLoggedIn"
+            type="button"
+            class="nav-pill"
+            :class="{ active: activeTab === 'profile' }"
+            @click="profileNameInput = displayCurrentUser; activeTab = 'profile'"
+          >
+            用户中心
+          </button>
+          <button
+            v-if="isAdmin"
+            type="button"
+            class="nav-pill"
+            @click="goToPath('/admin')"
+          >
+            🛡️ 管理员后台
+          </button>
         </nav>
 
         <div class="nav-actions">
@@ -371,13 +850,13 @@ onUnmounted(() => {
           </button>
 
           <button
-            v-if="userEmail"
+            v-if="isLoggedIn"
             type="button"
             class="icon-btn"
-            :title="`当前登录：${userEmail}，点击退出`"
+            :title="`当前用户：${displayCurrentUser}，点击退出`"
             @click="handleLogout"
           >
-            退出 ({{ getDisplayName(userEmail) }})
+            退出 ({{ displayCurrentUser }})
           </button>
           <button
             v-else
@@ -391,7 +870,6 @@ onUnmounted(() => {
       </header>
     </div>
 
-    <!-- 主内容 -->
     <main class="main-container">
       <div v-if="toastMsg" class="notice-bar">
         <span>{{ toastMsg }}</span>
@@ -402,11 +880,11 @@ onUnmounted(() => {
         <section class="hero-grid">
           <div class="glass-card hero-main">
             <div class="hero-profile">
-              <div class="hero-avatar">ZL</div>
+              <div class="hero-avatar">{{ getInitials(displayCurrentUser) }}</div>
               <div>
-                <h1 class="hero-title">Secr3tZL's base</h1>
+                <h1 class="hero-title">欢迎您，{{ displayCurrentUser }}</h1>
                 <p class="hero-subtitle">
-                  记录日常碎碎念、公共博客朋友圈与私密笔记的个人基地
+                  记录日常碎碎念、公共博客朋友圈与私密笔记的个人空间
                 </p>
               </div>
             </div>
@@ -464,7 +942,7 @@ onUnmounted(() => {
               <div>
                 <div class="card-meta" style="margin-bottom: 8px">
                   <span class="vis-badge public">🌐 公开</span>
-                  <span>{{ getDisplayName(post.author_email) }}</span>
+                  <span>{{ post.author_name || getDisplayName(post.author_email) }}</span>
                 </div>
                 <h3 class="blog-title">{{ post.title }}</h3>
                 <p class="blog-excerpt">{{ post.content }}</p>
@@ -501,7 +979,7 @@ onUnmounted(() => {
         </section>
       </template>
 
-      <!-- 2. 公共博客区（朋友圈排版） -->
+      <!-- 2. 公共博客区 -->
       <section v-if="activeTab === 'public_blog'" class="glass-card">
         <div class="section-header">
           <div>
@@ -521,10 +999,14 @@ onUnmounted(() => {
         </div>
         <div v-else class="pyq-feed">
           <article v-for="post in publicPosts" :key="post.id" class="pyq-item">
-            <div class="pyq-avatar">{{ getInitials(post.author_email) }}</div>
+            <div class="pyq-avatar">
+              {{ getInitials(post.author_name || post.author_email) }}
+            </div>
             <div class="pyq-body">
               <div class="pyq-top">
-                <span class="pyq-author">{{ getDisplayName(post.author_email) }}</span>
+                <span class="pyq-author">
+                  {{ post.author_name || getDisplayName(post.author_email) }}
+                </span>
                 <span class="vis-badge public">🌐 公开</span>
               </div>
 
@@ -537,22 +1019,22 @@ onUnmounted(() => {
                   <button type="button" class="btn-mini" @click="readingPost = post">
                     展开全文
                   </button>
-                  <template v-if="userEmail && userEmail === post.author_email">
-                    <button
-                      type="button"
-                      class="btn-mini"
-                      @click="handleTogglePostVisibility(post)"
-                    >
-                      设为私密
-                    </button>
-                    <button
-                      type="button"
-                      class="btn-danger-sm"
-                      @click="handleDeletePost(post.id)"
-                    >
-                      删除
-                    </button>
-                  </template>
+                  <button
+                    v-if="post.is_mine"
+                    type="button"
+                    class="btn-mini"
+                    @click="handleTogglePostVisibility(post)"
+                  >
+                    设为私密
+                  </button>
+                  <button
+                    v-if="post.is_mine || isAdmin"
+                    type="button"
+                    class="btn-danger-sm"
+                    @click="handleDeletePost(post.id)"
+                  >
+                    {{ post.is_mine ? "删除" : "删除违规" }}
+                  </button>
                 </div>
               </div>
             </div>
@@ -572,7 +1054,7 @@ onUnmounted(() => {
           </span>
         </div>
 
-        <form v-if="userEmail" class="composer-form" @submit.prevent="handlePublishNote">
+        <form v-if="isLoggedIn" class="composer-form" @submit.prevent="handlePublishNote">
           <textarea
             v-model="noteContent"
             class="field-textarea"
@@ -623,26 +1105,26 @@ onUnmounted(() => {
             <div class="card-meta">
               <div class="row-gap">
                 <span class="mood-badge">{{ note.mood || "日常" }}</span>
-                <span>{{ getDisplayName(note.author_email) }}</span>
+                <span>{{ note.author_name || getDisplayName(note.author_email) }}</span>
               </div>
               <div class="row-gap">
                 <span>{{ formatTime(note.created_at) }}</span>
-                <template v-if="userEmail && userEmail === note.author_email">
-                  <button
-                    type="button"
-                    class="btn-mini"
-                    @click="handleToggleNoteVisibility(note)"
-                  >
-                    设为私密
-                  </button>
-                  <button
-                    type="button"
-                    class="btn-danger-sm"
-                    @click="handleDeleteNote(note.id)"
-                  >
-                    删除
-                  </button>
-                </template>
+                <button
+                  v-if="note.is_mine"
+                  type="button"
+                  class="btn-mini"
+                  @click="handleToggleNoteVisibility(note)"
+                >
+                  设为私密
+                </button>
+                <button
+                  v-if="note.is_mine || isAdmin"
+                  type="button"
+                  class="btn-danger-sm"
+                  @click="handleDeleteNote(note.id)"
+                >
+                  {{ note.is_mine ? "删除" : "删除违规" }}
+                </button>
               </div>
             </div>
             <p class="card-text">{{ note.content }}</p>
@@ -658,7 +1140,7 @@ onUnmounted(() => {
             <p class="section-sub">仅你自己登录后可见，随时可一键转为公开</p>
           </div>
           <button
-            v-if="userEmail"
+            v-if="isLoggedIn"
             type="button"
             class="btn-primary"
             @click="openUploadBlog(false)"
@@ -667,7 +1149,7 @@ onUnmounted(() => {
           </button>
         </div>
 
-        <div v-if="!userEmail" class="notice-bar">
+        <div v-if="!isLoggedIn" class="notice-bar">
           <span>请先登录你的账号以查看和管理私密博客与私密日常</span>
           <button type="button" class="btn-primary" @click="showAuthModal = true">
             立即登录
@@ -685,7 +1167,9 @@ onUnmounted(() => {
                 <div class="pyq-avatar private-av">🔒</div>
                 <div class="pyq-body">
                   <div class="pyq-top">
-                    <span class="pyq-author">{{ getDisplayName(post.author_email) }}</span>
+                    <span class="pyq-author">
+                      {{ post.author_name || getDisplayName(post.author_email) }}
+                    </span>
                     <span class="vis-badge private">🔒 仅自己可见</span>
                   </div>
                   <h3 class="pyq-title" @click="readingPost = post">{{ post.title }}</h3>
@@ -751,10 +1235,52 @@ onUnmounted(() => {
           </div>
         </div>
       </section>
+
+      <!-- 5. 用户中心 -->
+      <section v-if="activeTab === 'profile' && isLoggedIn" class="glass-card">
+        <div class="section-header">
+          <div>
+            <h2 class="section-title">用户中心</h2>
+            <p class="section-sub">查看账号信息并修改你的显示用户名</p>
+          </div>
+          <span class="vis-badge" :class="isAdmin ? 'public' : 'private'">
+            {{ isAdmin ? "🛡️ 管理员" : "普通用户" }}
+          </span>
+        </div>
+
+        <form class="composer-form" @submit.prevent="handleUpdateUsername">
+          <div class="card-meta">当前用户名：{{ displayCurrentUser }}</div>
+          <div class="card-meta">当前绑定邮箱：{{ userEmail || "未填写" }}</div>
+
+          <template v-if="userId === 'root-admin'">
+            <div class="notice-bar">
+              <span>默认管理员 admin 用户名受系统保护，不可修改。</span>
+            </div>
+          </template>
+          <template v-else>
+            <input
+              v-model="profileNameInput"
+              type="text"
+              maxlength="20"
+              class="field-input"
+              placeholder="输入新的用户名（2~20 字，不可重复）"
+            />
+            <div class="flex-end">
+              <button
+                type="submit"
+                class="btn-primary"
+                :disabled="savingProfile || !profileNameInput.trim()"
+              >
+                {{ savingProfile ? "保存中..." : "保存用户名" }}
+              </button>
+            </div>
+          </template>
+        </form>
+      </section>
     </main>
 
     <footer class="site-footer">
-      <p>© 2026 Secr3tZL's base · Vue 3 + Cloudflare Pages &amp; D1 驱动</p>
+      <p>© 2026 欢迎您，{{ displayCurrentUser }} · Vue 3 + Cloudflare Pages &amp; D1 驱动</p>
     </footer>
 
     <!-- 独立上传博客弹窗 -->
@@ -833,7 +1359,7 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 登录 / 注册弹窗 -->
+    <!-- 前台登录 / 注册弹窗 -->
     <div v-if="showAuthModal" class="modal-backdrop" @click="showAuthModal = false">
       <div class="modal-box" @click.stop>
         <div class="section-header" style="margin-bottom: 0">
@@ -864,17 +1390,59 @@ onUnmounted(() => {
 
         <form class="col-gap" @submit.prevent="handleAuthSubmit">
           <input
-            v-model="emailInput"
-            type="email"
+            v-if="authMode === 'login'"
+            v-model="accountInput"
+            type="text"
             class="field-input"
-            placeholder="邮箱地址"
+            placeholder="用户名或邮箱"
           />
+          <template v-else>
+            <input
+              v-model="usernameInput"
+              type="text"
+              maxlength="20"
+              class="field-input"
+              placeholder="用户名（2~20 字，不可重复）"
+            />
+            <input
+              v-model="emailInput"
+              type="email"
+              class="field-input"
+              placeholder="邮箱地址（选填，可作为备用登录方式）"
+            />
+          </template>
+
           <input
             v-model="passwordInput"
             type="password"
             class="field-input"
-            placeholder="密码（至少 6 位）"
+            :placeholder="
+              authMode === 'login'
+                ? '请输入密码'
+                : '设置密码（至少 8 位，含大写字母和数字）'
+            "
           />
+
+          <template v-if="authMode === 'register'">
+            <input
+              v-model="confirmPasswordInput"
+              type="password"
+              class="field-input"
+              placeholder="请再次确认密码"
+            />
+            <div class="pwd-rules">
+              <span :class="{ ok: regPwdChecks.len }">
+                {{ regPwdChecks.len ? "✓" : "○" }} 至少 8 位字符
+              </span>
+              <span :class="{ ok: regPwdChecks.upper }">
+                {{ regPwdChecks.upper ? "✓" : "○" }} 至少 1 个大写字母 (A-Z)
+              </span>
+              <span :class="{ ok: regPwdChecks.digit }">
+                {{ regPwdChecks.digit ? "✓" : "○" }} 至少 1 个数字 (0-9)
+              </span>
+            </div>
+          </template>
+
           <p v-if="authMsg" class="auth-msg">{{ authMsg }}</p>
           <button type="submit" class="btn-primary" :disabled="authBusy">
             {{
@@ -884,30 +1452,32 @@ onUnmounted(() => {
         </form>
       </div>
     </div>
+  </div>
 
-    <!-- 阅读博客全文弹窗 -->
-    <div v-if="readingPost" class="modal-backdrop" @click="readingPost = null">
-      <div class="modal-box modal-wide" @click.stop>
-        <div class="section-header" style="margin-bottom: 0">
-          <h2 class="section-title" style="font-size: 22px">{{ readingPost.title }}</h2>
-          <button type="button" class="btn-ghost" @click="readingPost = null">
-            关闭
-          </button>
-        </div>
-        <div class="card-meta">
-          <div class="row-gap">
-            <span
-              class="vis-badge"
-              :class="readingPost.is_public ? 'public' : 'private'"
-            >
-              {{ readingPost.is_public ? "🌐 公开" : "🔒 仅自己可见" }}
-            </span>
-            <span>作者：{{ getDisplayName(readingPost.author_email) }}</span>
-          </div>
-          <span>发布于 {{ formatTime(readingPost.created_at) }}</span>
-        </div>
-        <div class="card-text read-body">{{ readingPost.content }}</div>
+  <!-- 公共阅读全文弹窗（前台与 /admin 后台共用） -->
+  <div v-if="readingPost" class="modal-backdrop" @click="readingPost = null">
+    <div class="modal-box modal-wide" @click.stop>
+      <div class="section-header" style="margin-bottom: 0">
+        <h2 class="section-title" style="font-size: 22px">{{ readingPost.title }}</h2>
+        <button type="button" class="btn-ghost" @click="readingPost = null">
+          关闭
+        </button>
       </div>
+      <div class="card-meta">
+        <div class="row-gap">
+          <span
+            class="vis-badge"
+            :class="readingPost.is_public ? 'public' : 'private'"
+          >
+            {{ readingPost.is_public ? "🌐 公开" : "🔒 仅自己可见" }}
+          </span>
+          <span>
+            作者：{{ readingPost.author_name || getDisplayName(readingPost.author_email) }}
+          </span>
+        </div>
+        <span>发布于 {{ formatTime(readingPost.created_at) }}</span>
+      </div>
+      <div class="card-text read-body">{{ readingPost.content }}</div>
     </div>
   </div>
 </template>
