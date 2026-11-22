@@ -26,17 +26,17 @@ interface DailyNote {
 
 export default function HomePage() {
   const [userEmail, setUserEmail] = useState<string | null>(null);
-  const [emailInput, setEmailInput] = useState("");
-  const [passwordInput, setPasswordInput] = useState("");
-  const [authMsg, setAuthMsg] = useState("");
+  const [emailInput, setEmailInput] = useState<string>("");
+  const [passwordInput, setPasswordInput] = useState<string>("");
+  const [authMsg, setAuthMsg] = useState<string>("");
 
   const [posts, setPosts] = useState<Post[]>([]);
-  const [title, setTitle] = useState("");
-  const [postContent, setPostContent] = useState("");
+  const [title, setTitle] = useState<string>("");
+  const [postContent, setPostContent] = useState<string>("");
 
   const [notes, setNotes] = useState<DailyNote[]>([]);
-  const [noteContent, setNoteContent] = useState("");
-  const [mood, setMood] = useState("日常");
+  const [noteContent, setNoteContent] = useState<string>("");
+  const [mood, setMood] = useState<string>("日常");
 
   useEffect(() => {
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
@@ -82,10 +82,10 @@ export default function HomePage() {
       .from("posts")
       .select("*")
       .order("created_at", { ascending: false });
-    if (data) setPosts(data);
+    if (data) setPosts(data as Post[]);
   }
 
-  async function handlePublishPost(e: React.FormEvent) {
+  async function handlePublishPost(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!title.trim() || !postContent.trim()) return;
     await supabase.from("posts").insert({
@@ -103,10 +103,10 @@ export default function HomePage() {
       .from("daily_notes")
       .select("*")
       .order("created_at", { ascending: false });
-    if (data) setNotes(data);
+    if (data) setNotes(data as DailyNote[]);
   }
 
-  async function handlePublishNote(e: React.FormEvent) {
+  async function handlePublishNote(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!noteContent.trim()) return;
     await supabase.from("daily_notes").insert({
@@ -150,14 +150,18 @@ export default function HomePage() {
               type="email"
               placeholder="邮箱"
               value={emailInput}
-              onChange={(e) => setEmailInput(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                setEmailInput(e.target.value)
+              }
               className="px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
             />
             <input
               type="password"
               placeholder="密码（至少6位）"
               value={passwordInput}
-              onChange={(e) => setPasswordInput(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                setPasswordInput(e.target.value)
+              }
               className="px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
             />
             <button
@@ -183,7 +187,9 @@ export default function HomePage() {
           <div className="flex flex-wrap gap-2">
             <select
               value={mood}
-              onChange={(e) => setMood(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
+                setMood(e.target.value)
+              }
               className="px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
             >
               <option value="日常">日常</option>
@@ -195,7 +201,9 @@ export default function HomePage() {
               type="text"
               placeholder="发一条今天的日常..."
               value={noteContent}
-              onChange={(e) => setNoteContent(e.target.value)}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                setNoteContent(e.target.value)
+              }
               className="flex-1 min-w-[220px] px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
             />
             <button
@@ -232,14 +240,18 @@ export default function HomePage() {
             type="text"
             placeholder="文章标题"
             value={title}
-            onChange={(e) => setTitle(e.target.value)}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+              setTitle(e.target.value)
+            }
             className="w-full px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
           />
           <textarea
             rows={4}
             placeholder="写一篇博客..."
             value={postContent}
-            onChange={(e) => setPostContent(e.target.value)}
+            onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) =>
+              setPostContent(e.target.value)
+            }
             className="w-full px-3 py-2 rounded bg-slate-800 border border-slate-700 text-sm"
           />
           <button
