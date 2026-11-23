@@ -5,6 +5,12 @@ interface Env {
 
 type UserRole = "admin" | "user";
 type UserStatus = "active" | "disabled" | "banned";
+type FriendRelation =
+  | "none"
+  | "self"
+  | "friends"
+  | "outgoing_pending"
+  | "incoming_pending";
 
 interface UserRow {
   id: string;
@@ -68,6 +74,15 @@ interface NoteRow {
   author_uid: number | null;
   author_name: string;
   created_at: string;
+}
+
+interface FriendshipRow {
+  id: string;
+  requester_id: string;
+  addressee_id: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
 }
 
 interface JwtPayload {
@@ -260,6 +275,31 @@ function generatePersonalId(): string {
   return `u_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
 }
 
+async function getRelationBetween(
+  db: D1Database,
+  meId: string | null,
+  targetId: string
+): Promise<{ relation: FriendRelation; friendship_id: string | null }> {
+  if (!meId) return { relation: "none", friendship_id: null };
+  if (meId === targetId) return { relation: "self", friendship_id: null };
+
+  const row = await db
+    .prepare(
+      "SELECT id, requester_id, addressee_id, status FROM friendships WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?) LIMIT 1"
+    )
+    .bind(meId, targetId, targetId, meId)
+    .first<FriendshipRow>();
+
+  if (!row) return { relation: "none", friendship_id: null };
+  if (row.status === "accepted") {
+    return { relation: "friends", friendship_id: row.id };
+  }
+  if (row.requester_id === meId) {
+    return { relation: "outgoing_pending", friendship_id: row.id };
+  }
+  return { relation: "incoming_pending", friendship_id: row.id };
+}
+
 export const onRequest: PagesFunction<Env> = async (context) => {
   const { request, env, params } = context;
   const method = request.method.toUpperCase();
@@ -396,7 +436,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       }
     }
 
-    // 2. 用户资料：修改用户名 & 限改一次个人 ID
+    // 2. 个人资料修改：/api/user/*
     if (segments[0] === "user") {
       const currentUser = await getCurrentUser(env.DB, request, secret);
       const errRes = checkPermission(currentUser);
@@ -453,7 +493,270 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       }
     }
 
-    // 3. 管理员后台：/api/admin/*
+    // 3. 搜索用户与查看他人公开主页：/api/users/*
+    if (segments[0] === "users") {
+      const rawUser = await getCurrentUser(env.DB, request, secret);
+      const currentUser = rawUser && rawUser.status !== "banned" ? rawUser : null;
+
+      // 3.1 搜索用户（按 UID / 个人 ID / 用户名）
+      if (segments[1] === "search" && method === "GET") {
+        const url = new URL(request.url);
+        const q = (url.searchParams.get("q") || "").trim();
+        if (!q) return jsonRes([]);
+
+        const cleanUid = q.replace(/^#/, "");
+        const numericUid = /^\d+$/.test(cleanUid) ? Number(cleanUid) : -1;
+        const likePattern = `%${q}%`;
+
+        const { results } = await env.DB.prepare(
+          "SELECT id, uid, personal_id, username, role, status, created_at FROM users WHERE status != 'banned' AND (uid = ? OR LOWER(personal_id) = LOWER(?) OR LOWER(username) LIKE LOWER(?)) ORDER BY uid ASC LIMIT 20"
+        )
+          .bind(numericUid, q, likePattern)
+          .all<UserRow>();
+
+        const enriched = await Promise.all(
+          results.map(async (u) => {
+            const rel = await getRelationBetween(env.DB!, currentUser?.id ?? null, u.id);
+            return {
+              id: u.id,
+              uid: u.uid,
+              personal_id: u.personal_id || u.id,
+              username: u.username,
+              role: normalizeRole(u.role),
+              status: normalizeStatus(u.status),
+              created_at: u.created_at || "",
+              relation: rel.relation,
+              friendship_id: rel.friendship_id,
+            };
+          })
+        );
+        return jsonRes(enriched);
+      }
+
+      // 3.2 查看他人个人主页（公开资料 + 公开帖子 + 公开日常 + 好友关系）
+      if (segments[1] && !segments[2] && method === "GET") {
+        const targetKey = decodeURIComponent(segments[1]).trim();
+        const numericUid = /^\d+$/.test(targetKey) ? Number(targetKey) : -1;
+
+        const targetUser = await env.DB.prepare(
+          "SELECT id, uid, personal_id, username, role, status, created_at FROM users WHERE id = ? OR uid = ? OR LOWER(personal_id) = LOWER(?) LIMIT 1"
+        )
+          .bind(targetKey, numericUid, targetKey)
+          .first<UserRow>();
+
+        if (!targetUser) {
+          return jsonRes({ error: "该用户不存在或已注销" }, 404);
+        }
+
+        const rel = await getRelationBetween(env.DB, currentUser?.id ?? null, targetUser.id);
+        const viewerId = currentUser ? currentUser.id : "__guest__";
+
+        const [postsRes, notesRes, friendCountRow] = await Promise.all([
+          env.DB.prepare(
+            "SELECT p.id, p.title, p.content, p.is_public, p.author_id, u.uid AS author_uid, COALESCE(u.username, '已注销用户') AS author_name, p.created_at, (SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id = p.id) AS like_count, (SELECT COUNT(*) FROM post_comments pc WHERE pc.post_id = p.id) AS comment_count, (SELECT COUNT(*) FROM post_likes pl WHERE pl.post_id = p.id AND pl.user_id = ?) AS liked_by_me FROM posts p LEFT JOIN users u ON p.author_id = u.id WHERE p.author_id = ? AND p.is_public = 1 ORDER BY p.created_at DESC"
+          )
+            .bind(viewerId, targetUser.id)
+            .all<PostRow>(),
+          env.DB.prepare(
+            "SELECT n.id, n.content, n.mood, n.is_public, n.author_id, u.uid AS author_uid, COALESCE(u.username, '已注销用户') AS author_name, n.created_at FROM daily_notes n LEFT JOIN users u ON n.author_id = u.id WHERE n.author_id = ? AND n.is_public = 1 ORDER BY n.created_at DESC"
+          )
+            .bind(targetUser.id)
+            .all<NoteRow>(),
+          env.DB.prepare(
+            "SELECT COUNT(*) AS c FROM friendships WHERE status = 'accepted' AND (requester_id = ? OR addressee_id = ?)"
+          )
+            .bind(targetUser.id, targetUser.id)
+            .first<{ c: number }>(),
+        ]);
+
+        return jsonRes({
+          user: {
+            id: targetUser.id,
+            uid: targetUser.uid,
+            personal_id: targetUser.personal_id || targetUser.id,
+            username: targetUser.username,
+            role: normalizeRole(targetUser.role),
+            status: normalizeStatus(targetUser.status),
+            created_at: targetUser.created_at || "",
+            friend_count: Number(friendCountRow?.c || 0),
+          },
+          relation: rel.relation,
+          friendship_id: rel.friendship_id,
+          posts: postsRes.results.map((r) => ({
+            ...r,
+            is_public: true,
+            like_count: Number(r.like_count || 0),
+            comment_count: Number(r.comment_count || 0),
+            liked_by_me: Boolean(r.liked_by_me),
+            is_mine: Boolean(currentUser && r.author_id === currentUser.id),
+          })),
+          notes: notesRes.results.map((r) => ({
+            ...r,
+            is_public: true,
+            is_mine: Boolean(currentUser && r.author_id === currentUser.id),
+          })),
+        });
+      }
+    }
+
+    // 4. 好友系统：/api/friends/*
+    if (segments[0] === "friends") {
+      const currentUser = await getCurrentUser(env.DB, request, secret);
+      const errRes = checkPermission(currentUser, method === "GET");
+      if (errRes || !currentUser) return errRes ?? jsonRes({ error: "请先登录" }, 401);
+
+      // 4.1 获取好友列表、收到的申请、发出的申请
+      if (!segments[1] && method === "GET") {
+        const { results } = await env.DB.prepare(
+          "SELECT f.id AS friendship_id, f.requester_id, f.addressee_id, f.status, f.created_at AS req_time, u.id AS user_id, u.uid, u.personal_id, u.username, u.role, u.status AS user_status FROM friendships f JOIN users u ON u.id = CASE WHEN f.requester_id = ? THEN f.addressee_id ELSE f.requester_id END WHERE f.requester_id = ? OR f.addressee_id = ? ORDER BY f.updated_at DESC"
+        )
+          .bind(currentUser.id, currentUser.id, currentUser.id)
+          .all<{
+            friendship_id: string;
+            requester_id: string;
+            addressee_id: string;
+            status: string;
+            req_time: string;
+            user_id: string;
+            uid: number;
+            personal_id: string;
+            username: string;
+            role: string;
+            user_status: string;
+          }>();
+
+        const friends = [];
+        const incoming = [];
+        const outgoing = [];
+
+        for (const r of results) {
+          const item = {
+            friendship_id: r.friendship_id,
+            id: r.user_id,
+            uid: r.uid,
+            personal_id: r.personal_id || r.user_id,
+            username: r.username,
+            role: normalizeRole(r.role),
+            status: normalizeStatus(r.user_status),
+            created_at: r.req_time,
+          };
+          if (r.status === "accepted") {
+            friends.push(item);
+          } else if (r.addressee_id === currentUser.id) {
+            incoming.push(item);
+          } else {
+            outgoing.push(item);
+          }
+        }
+
+        return jsonRes({ friends, incoming, outgoing });
+      }
+
+      // 4.2 发送好友申请（支持 target_user_id 或 account）
+      if (segments[1] === "request" && method === "POST") {
+        const body = await readJsonBody(request);
+        const rawTarget = String(body.target_user_id || body.account || "").trim();
+        if (!rawTarget) return jsonRes({ error: "请输入对方 UID、个人 ID 或用户名" }, 400);
+
+        const cleanUid = rawTarget.replace(/^#/, "");
+        const numericUid = /^\d+$/.test(cleanUid) ? Number(cleanUid) : -1;
+
+        const targetUser = await env.DB.prepare(
+          "SELECT id, uid, personal_id, username, status FROM users WHERE id = ? OR uid = ? OR LOWER(personal_id) = LOWER(?) OR LOWER(username) = LOWER(?) LIMIT 1"
+        )
+          .bind(rawTarget, numericUid, rawTarget, rawTarget)
+          .first<UserRow>();
+
+        if (!targetUser) return jsonRes({ error: "未找到该用户" }, 404);
+        if (targetUser.id === currentUser.id) {
+          return jsonRes({ error: "不能添加自己为好友" }, 400);
+        }
+        if (normalizeStatus(targetUser.status) === "banned") {
+          return jsonRes({ error: "对方账号已被封号，无法添加" }, 403);
+        }
+
+        const existing = await env.DB.prepare(
+          "SELECT id, requester_id, addressee_id, status FROM friendships WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?) LIMIT 1"
+        )
+          .bind(currentUser.id, targetUser.id, targetUser.id, currentUser.id)
+          .first<FriendshipRow>();
+
+        const now = new Date().toISOString();
+
+        if (existing) {
+          if (existing.status === "accepted") {
+            return jsonRes({ error: "你们已经是好友了" }, 409);
+          }
+          if (existing.requester_id === currentUser.id) {
+            return jsonRes({ error: "已发送过好友申请，请等待对方确认" }, 409);
+          }
+          // 如果对方正好之前向我发过申请，直接互相同意成为好友
+          await env.DB.prepare(
+            "UPDATE friendships SET status = 'accepted', updated_at = ? WHERE id = ?"
+          )
+            .bind(now, existing.id)
+            .run();
+          return jsonRes({
+            ok: true,
+            relation: "friends",
+            friendship_id: existing.id,
+            message: `对方之前已向你发出申请，已自动成为好友`,
+          });
+        }
+
+        const id = crypto.randomUUID();
+        await env.DB.prepare(
+          "INSERT INTO friendships (id, requester_id, addressee_id, status, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?)"
+        )
+          .bind(id, currentUser.id, targetUser.id, now, now)
+          .run();
+
+        return jsonRes({
+          ok: true,
+          relation: "outgoing_pending",
+          friendship_id: id,
+          message: `已向 ${targetUser.username} (#${targetUser.uid}) 发送好友申请`,
+        });
+      }
+
+      // 4.3 同意好友申请
+      if (segments[1] && segments[2] === "accept" && method === "POST") {
+        const friendshipId = segments[1];
+        const row = await env.DB.prepare(
+          "SELECT id, addressee_id, status FROM friendships WHERE id = ?"
+        )
+          .bind(friendshipId)
+          .first<FriendshipRow>();
+        if (!row) return jsonRes({ error: "好友申请不存在或已被取消" }, 404);
+        if (row.addressee_id !== currentUser.id) {
+          return jsonRes({ error: "无权处理该好友申请" }, 403);
+        }
+        await env.DB.prepare(
+          "UPDATE friendships SET status = 'accepted', updated_at = ? WHERE id = ?"
+        )
+          .bind(new Date().toISOString(), friendshipId)
+          .run();
+        return jsonRes({ ok: true, relation: "friends" });
+      }
+
+      // 4.4 拒绝 / 取消申请 / 删除好友
+      if (segments[1] && !segments[2] && method === "DELETE") {
+        const friendshipId = segments[1];
+        const row = await env.DB.prepare(
+          "SELECT id, requester_id, addressee_id FROM friendships WHERE id = ?"
+        )
+          .bind(friendshipId)
+          .first<FriendshipRow>();
+        if (!row) return jsonRes({ error: "记录不存在" }, 404);
+        if (row.requester_id !== currentUser.id && row.addressee_id !== currentUser.id) {
+          return jsonRes({ error: "无权操作该好友关系" }, 403);
+        }
+        await env.DB.prepare("DELETE FROM friendships WHERE id = ?").bind(friendshipId).run();
+        return jsonRes({ ok: true, relation: "none" });
+      }
+    }
+
+    // 5. 管理员后台：/api/admin/*
     if (segments[0] === "admin") {
       if (segments[1] === "status" && method === "GET") {
         const existingAdmin = await env.DB.prepare(
@@ -579,12 +882,11 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       }
     }
 
-    // 4. 社区帖子、点赞、楼中楼评论与评论点赞：/api/posts/*
+    // 6. 社区帖子、点赞、楼中楼评论与评论点赞：/api/posts/*
     if (segments[0] === "posts") {
       const rawUser = await getCurrentUser(env.DB, request, secret);
       const currentUser = rawUser && rawUser.status !== "banned" ? rawUser : null;
 
-      // 4.1 帖子点赞 / 取消点赞
       if (segments[1] && segments[2] === "like" && method === "POST") {
         const errRes = checkPermission(rawUser);
         if (errRes || !rawUser) return errRes ?? jsonRes({ error: "请先登录" }, 401);
@@ -628,7 +930,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         return jsonRes({ liked, like_count: Number(cnt?.c || 0) });
       }
 
-      // 4.2 评论点赞 / 取消点赞
       if (
         segments[1] &&
         segments[2] === "comments" &&
@@ -676,7 +977,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         return jsonRes({ liked, like_count: Number(cnt?.c || 0) });
       }
 
-      // 4.3 获取帖子评论列表
       if (segments[1] && segments[2] === "comments" && !segments[3] && method === "GET") {
         const post = await env.DB.prepare(
           "SELECT id, is_public, author_id FROM posts WHERE id = ?"
@@ -707,7 +1007,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         );
       }
 
-      // 4.4 发表主评论或楼中楼回复
       if (segments[1] && segments[2] === "comments" && !segments[3] && method === "POST") {
         const errRes = checkPermission(rawUser);
         if (errRes || !rawUser) return errRes ?? jsonRes({ error: "请先登录" }, 401);
@@ -765,7 +1064,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         });
       }
 
-      // 4.5 删除评论（含级联清理楼中楼子回复）
       if (
         segments[1] &&
         segments[2] === "comments" &&
@@ -811,7 +1109,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         return jsonRes({ ok: true, comment_count: Number(cnt?.c || 0) });
       }
 
-      // 4.6 获取帖子列表
       if (!segments[1] && method === "GET") {
         const viewerId = currentUser ? currentUser.id : "__guest__";
         const stmt = currentUser
@@ -835,7 +1132,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         );
       }
 
-      // 4.7 发布帖子
       if (!segments[1] && method === "POST") {
         const errRes = checkPermission(rawUser);
         if (errRes || !rawUser) return errRes ?? jsonRes({ error: "请先登录" }, 401);
@@ -871,7 +1167,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         });
       }
 
-      // 4.8 切换帖子公开/私密
       if (segments[1] && !segments[2] && method === "PATCH") {
         const errRes = checkPermission(rawUser);
         if (errRes || !rawUser) return errRes ?? jsonRes({ error: "请先登录" }, 401);
@@ -884,7 +1179,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         return jsonRes({ ok: true, is_public: Boolean(isPublicInt) });
       }
 
-      // 4.9 删除帖子
       if (segments[1] && !segments[2] && method === "DELETE") {
         const errRes = checkPermission(rawUser, true);
         if (errRes || !rawUser) return errRes ?? jsonRes({ error: "请先登录" }, 401);
@@ -915,7 +1209,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       }
     }
 
-    // 5. 日常动态：/api/notes/*
+    // 7. 日常动态：/api/notes/*
     if (segments[0] === "notes") {
       const rawUser = await getCurrentUser(env.DB, request, secret);
       const currentUser = rawUser && rawUser.status !== "banned" ? rawUser : null;

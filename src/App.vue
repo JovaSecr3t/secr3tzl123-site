@@ -3,11 +3,17 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 
 type ThemeMode = "dark" | "light";
 type PaletteKey = "ocean" | "violet" | "emerald" | "sunset" | "rose";
-type FrontendTab = "home" | "community" | "moments" | "private_space" | "profile";
+type FrontendTab = "home" | "community" | "moments" | "friends" | "private_space" | "profile";
 type AdminSubTab = "users" | "posts";
 type AuthMode = "login" | "register";
 type UserRole = "admin" | "user";
 type UserStatus = "active" | "disabled" | "banned";
+type FriendRelation =
+  | "none"
+  | "self"
+  | "friends"
+  | "outgoing_pending"
+  | "incoming_pending";
 
 interface PaletteOption {
   key: PaletteKey;
@@ -82,6 +88,46 @@ interface NoteItem {
   author_name: string;
   is_mine: boolean;
   created_at: string;
+}
+
+interface FriendUserItem {
+  friendship_id: string;
+  id: string;
+  uid: number;
+  personal_id: string;
+  username: string;
+  role: UserRole;
+  status: UserStatus;
+  created_at: string;
+}
+
+interface UserSearchResult {
+  id: string;
+  uid: number;
+  personal_id: string;
+  username: string;
+  role: UserRole;
+  status: UserStatus;
+  created_at: string;
+  relation: FriendRelation;
+  friendship_id: string | null;
+}
+
+interface PublicProfileData {
+  user: {
+    id: string;
+    uid: number;
+    personal_id: string;
+    username: string;
+    role: UserRole;
+    status: UserStatus;
+    created_at: string;
+    friend_count: number;
+  };
+  relation: FriendRelation;
+  friendship_id: string | null;
+  posts: PostItem[];
+  notes: NoteItem[];
 }
 
 interface RegSuccessInfo {
@@ -175,6 +221,21 @@ const savingPersonalId = ref<boolean>(false);
 const posts = ref<PostItem[]>([]);
 const notes = ref<NoteItem[]>([]);
 const loadingData = ref<boolean>(true);
+
+// 好友系统与他人主页
+const friendsList = ref<FriendUserItem[]>([]);
+const incomingRequests = ref<FriendUserItem[]>([]);
+const outgoingRequests = ref<FriendUserItem[]>([]);
+const loadingFriends = ref<boolean>(false);
+const friendSearchQuery = ref<string>("");
+const friendSearchResults = ref<UserSearchResult[]>([]);
+const searchingUsers = ref<boolean>(false);
+const hasSearchedUsers = ref<boolean>(false);
+
+const viewingProfile = ref<PublicProfileData | null>(null);
+const loadingUserProfile = ref<boolean>(false);
+const profileSubTab = ref<"posts" | "notes">("posts");
+const friendActionBusy = ref<boolean>(false);
 
 // 评论与楼中楼
 const openCommentPostId = ref<string | null>(null);
@@ -336,6 +397,9 @@ function clearUserSession(): void {
   userStatus.value = "active";
   profileNameInput.value = "";
   profileIdInput.value = "";
+  friendsList.value = [];
+  incomingRequests.value = [];
+  outgoingRequests.value = [];
 }
 
 async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -369,6 +433,158 @@ async function fetchAllData(): Promise<void> {
   }
 }
 
+async function fetchFriendsData(): Promise<void> {
+  if (!isLoggedIn.value) return;
+  loadingFriends.value = true;
+  try {
+    const res = await apiFetch<{
+      friends: FriendUserItem[];
+      incoming: FriendUserItem[];
+      outgoing: FriendUserItem[];
+    }>("/api/friends");
+    friendsList.value = res.friends || [];
+    incomingRequests.value = res.incoming || [];
+    outgoingRequests.value = res.outgoing || [];
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "获取好友列表失败"));
+  } finally {
+    loadingFriends.value = false;
+  }
+}
+
+async function openUserProfile(targetUserId: string | null | undefined): Promise<void> {
+  if (!targetUserId) return;
+  loadingUserProfile.value = true;
+  profileSubTab.value = "posts";
+  try {
+    viewingProfile.value = await apiFetch<PublicProfileData>(
+      `/api/users/${encodeURIComponent(targetUserId)}`
+    );
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "打开个人主页失败"));
+  } finally {
+    loadingUserProfile.value = false;
+  }
+}
+
+async function handleSearchUsers(): Promise<void> {
+  const q = friendSearchQuery.value.trim();
+  if (!q) {
+    friendSearchResults.value = [];
+    hasSearchedUsers.value = false;
+    return;
+  }
+  searchingUsers.value = true;
+  hasSearchedUsers.value = true;
+  try {
+    friendSearchResults.value = await apiFetch<UserSearchResult[]>(
+      `/api/users/search?q=${encodeURIComponent(q)}`
+    );
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "搜索用户失败"));
+  } finally {
+    searchingUsers.value = false;
+  }
+}
+
+async function handleSendFriendRequest(targetUserId: string): Promise<void> {
+  if (!isLoggedIn.value) {
+    openAuthModal("login");
+    authMsg.value = "请先登录后再添加好友";
+    return;
+  }
+  friendActionBusy.value = true;
+  try {
+    const res = await apiFetch<{
+      ok: boolean;
+      relation: FriendRelation;
+      friendship_id: string;
+      message?: string;
+    }>("/api/friends/request", {
+      method: "POST",
+      body: JSON.stringify({ target_user_id: targetUserId }),
+    });
+
+    if (viewingProfile.value?.user.id === targetUserId) {
+      viewingProfile.value.relation = res.relation;
+      viewingProfile.value.friendship_id = res.friendship_id;
+      if (res.relation === "friends") {
+        viewingProfile.value.user.friend_count += 1;
+      }
+    }
+    const found = friendSearchResults.value.find((u) => u.id === targetUserId);
+    if (found) {
+      found.relation = res.relation;
+      found.friendship_id = res.friendship_id;
+    }
+
+    showNotice(res.message || "好友申请已发送");
+    await fetchFriendsData();
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "发送好友申请失败"));
+  } finally {
+    friendActionBusy.value = false;
+  }
+}
+
+async function handleAcceptFriend(friendshipId: string, targetUserId?: string): Promise<void> {
+  friendActionBusy.value = true;
+  try {
+    await apiFetch<{ ok: boolean; relation: FriendRelation }>(
+      `/api/friends/${friendshipId}/accept`,
+      { method: "POST" }
+    );
+    if (targetUserId && viewingProfile.value?.user.id === targetUserId) {
+      viewingProfile.value.relation = "friends";
+      viewingProfile.value.user.friend_count += 1;
+    }
+    const found = friendSearchResults.value.find((u) => u.friendship_id === friendshipId);
+    if (found) found.relation = "friends";
+    showNotice("已同意好友申请");
+    await fetchFriendsData();
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "操作失败"));
+  } finally {
+    friendActionBusy.value = false;
+  }
+}
+
+async function handleRemoveFriendship(
+  friendshipId: string | null,
+  targetUserId?: string,
+  confirmText?: string
+): Promise<void> {
+  if (!friendshipId) return;
+  if (confirmText && !window.confirm(confirmText)) return;
+  friendActionBusy.value = true;
+  try {
+    await apiFetch<{ ok: boolean; relation: FriendRelation }>(`/api/friends/${friendshipId}`, {
+      method: "DELETE",
+    });
+    if (targetUserId && viewingProfile.value?.user.id === targetUserId) {
+      if (viewingProfile.value.relation === "friends") {
+        viewingProfile.value.user.friend_count = Math.max(
+          0,
+          viewingProfile.value.user.friend_count - 1
+        );
+      }
+      viewingProfile.value.relation = "none";
+      viewingProfile.value.friendship_id = null;
+    }
+    const found = friendSearchResults.value.find((u) => u.friendship_id === friendshipId);
+    if (found) {
+      found.relation = "none";
+      found.friendship_id = null;
+    }
+    showNotice("已更新好友关系");
+    await fetchFriendsData();
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "操作失败"));
+  } finally {
+    friendActionBusy.value = false;
+  }
+}
+
 async function checkSession(): Promise<void> {
   if (!localStorage.getItem(TOKEN_KEY)) {
     clearUserSession();
@@ -376,8 +592,12 @@ async function checkSession(): Promise<void> {
   }
   try {
     const res = await apiFetch<AuthSessionResponse>("/api/auth/me");
-    if (res.id) applyUserSession(res);
-    else clearUserSession();
+    if (res.id) {
+      applyUserSession(res);
+      await fetchFriendsData();
+    } else {
+      clearUserSession();
+    }
   } catch (err: unknown) {
     clearUserSession();
     if (err instanceof Error && err.message) showNotice(err.message);
@@ -510,7 +730,7 @@ async function handleFrontendAuth(): Promise<void> {
     applyUserSession(res);
     passwordInput.value = "";
     confirmPasswordInput.value = "";
-    await fetchAllData();
+    await Promise.all([fetchAllData(), fetchFriendsData()]);
 
     if (isLogin) {
       showAuthModal.value = false;
@@ -600,7 +820,12 @@ async function handleLogout(): Promise<void> {
   openCommentPostId.value = null;
   postComments.value = [];
   replyTarget.value = null;
-  if (activeTab.value === "private_space" || activeTab.value === "profile") {
+  viewingProfile.value = null;
+  if (
+    activeTab.value === "private_space" ||
+    activeTab.value === "profile" ||
+    activeTab.value === "friends"
+  ) {
     activeTab.value = "home";
   }
   showNotice("已退出登录");
@@ -653,6 +878,9 @@ async function handleDeletePost(id: string): Promise<void> {
   try {
     await apiFetch<{ ok: boolean }>(`/api/posts/${id}`, { method: "DELETE" });
     posts.value = posts.value.filter((p) => p.id !== id);
+    if (viewingProfile.value) {
+      viewingProfile.value.posts = viewingProfile.value.posts.filter((p) => p.id !== id);
+    }
     if (readingPost.value?.id === id) readingPost.value = null;
     if (openCommentPostId.value === id) {
       openCommentPostId.value = null;
@@ -827,6 +1055,9 @@ async function handleDeleteNote(id: string): Promise<void> {
   try {
     await apiFetch<{ ok: boolean }>(`/api/notes/${id}`, { method: "DELETE" });
     notes.value = notes.value.filter((n) => n.id !== id);
+    if (viewingProfile.value) {
+      viewingProfile.value.notes = viewingProfile.value.notes.filter((n) => n.id !== id);
+    }
     showNotice("已删除日常");
   } catch (err: unknown) {
     showNotice(getErrorMessage(err, "删除失败"));
@@ -1347,6 +1578,15 @@ onUnmounted(() => {
           <button type="button" class="nav-pill" :class="{ active: activeTab === 'moments' }" @click="activeTab = 'moments'">
             日常动态
           </button>
+          <button
+            type="button"
+            class="nav-pill"
+            :class="{ active: activeTab === 'friends' }"
+            @click="activeTab = 'friends'; if (isLoggedIn) fetchFriendsData()"
+          >
+            👥 好友
+            <span v-if="incomingRequests.length > 0" class="badge-dot">{{ incomingRequests.length }}</span>
+          </button>
           <button type="button" class="nav-pill" :class="{ active: activeTab === 'private_space' }" @click="activeTab = 'private_space'">
             🔒 私密空间
           </button>
@@ -1410,13 +1650,14 @@ onUnmounted(() => {
               <div class="hero-avatar">{{ getInitials(displayCurrentUser) }}</div>
               <div>
                 <h1 class="hero-title">欢迎您，{{ displayCurrentUser }}</h1>
-                <p class="hero-subtitle">社区交流、日常动态与个人私密空间</p>
+                <p class="hero-subtitle">社区交流、日常动态、好友互动与私密空间</p>
               </div>
             </div>
             <div class="tag-row">
               <span class="tag-chip"><span class="status-dot" />社区运行中</span>
               <span v-if="isLoggedIn && userUid" class="tag-chip">专属 UID：#{{ userUid }}</span>
               <span v-if="isLoggedIn && userPersonalId" class="tag-chip">个人 ID：{{ userPersonalId }}</span>
+              <span v-if="isLoggedIn" class="tag-chip">好友：{{ friendsList.length }} 人</span>
               <span v-else class="tag-chip">点击右上角登录获取专属 UID</span>
             </div>
           </div>
@@ -1443,7 +1684,7 @@ onUnmounted(() => {
           <div class="section-header">
             <div>
               <h2 class="section-title">社区 · 最新帖子</h2>
-              <p class="section-sub">浏览大家公开分享的内容，支持点赞、楼中楼评论与公开/私密切换</p>
+              <p class="section-sub">点击用户昵称可查看对方个人主页并添加好友</p>
             </div>
             <button type="button" class="link-btn" @click="activeTab = 'community'">进入社区 →</button>
           </div>
@@ -1457,10 +1698,14 @@ onUnmounted(() => {
               <div>
                 <div class="card-meta" style="margin-bottom: 8px">
                   <span class="vis-badge public">🌐 社区公开</span>
-                  <span>
+                  <button
+                    type="button"
+                    class="user-link-btn"
+                    @click.stop="openUserProfile(post.author_id)"
+                  >
                     {{ post.author_name }}
                     <span v-if="post.author_uid" class="uid-tag">#{{ post.author_uid }}</span>
-                  </span>
+                  </button>
                 </div>
                 <h3 class="blog-title">{{ post.title }}</h3>
                 <p class="blog-excerpt">{{ post.content }}</p>
@@ -1484,7 +1729,17 @@ onUnmounted(() => {
           <div v-else class="feed-list">
             <div v-for="note in publicNotes.slice(0, 3)" :key="note.id" class="moment-card">
               <div class="card-meta">
-                <span class="mood-badge">{{ note.mood || "日常" }}</span>
+                <div class="row-gap">
+                  <span class="mood-badge">{{ note.mood || "日常" }}</span>
+                  <button
+                    type="button"
+                    class="user-link-btn"
+                    @click="openUserProfile(note.author_id)"
+                  >
+                    {{ note.author_name }}
+                    <span v-if="note.author_uid" class="uid-tag">#{{ note.author_uid }}</span>
+                  </button>
+                </div>
                 <span>{{ formatTime(note.created_at) }}</span>
               </div>
               <p class="card-text">{{ note.content }}</p>
@@ -1498,7 +1753,7 @@ onUnmounted(() => {
         <div class="section-header">
           <div>
             <h2 class="section-title">社区广场</h2>
-            <p class="section-sub">所有公开帖子均展示在这里，共 {{ publicPosts.length }} 篇</p>
+            <p class="section-sub">点击任意用户头像或昵称可打开主页，共 {{ publicPosts.length }} 篇帖子</p>
           </div>
           <button type="button" class="btn-primary" @click="openPostModal(true)">＋ 发布帖子</button>
         </div>
@@ -1509,11 +1764,24 @@ onUnmounted(() => {
         </div>
         <div v-else class="pyq-feed">
           <article v-for="post in publicPosts" :key="post.id" class="pyq-item">
-            <div class="pyq-avatar">{{ getInitials(post.author_name) }}</div>
+            <button
+              type="button"
+              class="pyq-avatar clickable-avatar"
+              title="查看个人主页"
+              @click="openUserProfile(post.author_id)"
+            >
+              {{ getInitials(post.author_name) }}
+            </button>
             <div class="pyq-body">
               <div class="pyq-top">
                 <div class="row-gap">
-                  <span class="pyq-author">{{ post.author_name }}</span>
+                  <button
+                    type="button"
+                    class="pyq-author user-link-btn"
+                    @click="openUserProfile(post.author_id)"
+                  >
+                    {{ post.author_name }}
+                  </button>
                   <span v-if="post.author_uid" class="uid-tag">#{{ post.author_uid }}</span>
                 </div>
                 <span class="vis-badge public">🌐 公开</span>
@@ -1556,7 +1824,14 @@ onUnmounted(() => {
                   <div v-for="c in commentTree" :key="c.id" class="comment-item">
                     <div class="card-meta">
                       <div class="row-gap">
-                        <strong>{{ c.author_name }}</strong>
+                        <button
+                          type="button"
+                          class="user-link-btn"
+                          style="font-weight: 700; color: var(--text-main)"
+                          @click="openUserProfile(c.user_id)"
+                        >
+                          {{ c.author_name }}
+                        </button>
                         <span v-if="c.author_uid" class="uid-tag">#{{ c.author_uid }}</span>
                         <span>{{ formatTime(c.created_at) }}</span>
                       </div>
@@ -1588,7 +1863,14 @@ onUnmounted(() => {
                       <div v-for="r in c.replies" :key="r.id" class="reply-item">
                         <div class="card-meta">
                           <div class="row-gap">
-                            <strong>{{ r.author_name }}</strong>
+                            <button
+                              type="button"
+                              class="user-link-btn"
+                              style="font-weight: 700; color: var(--text-main)"
+                              @click="openUserProfile(r.user_id)"
+                            >
+                              {{ r.author_name }}
+                            </button>
                             <span v-if="r.author_uid" class="uid-tag">#{{ r.author_uid }}</span>
                             <span v-if="r.reply_to_name" class="reply-at">回复 @{{ r.reply_to_name }}</span>
                             <span>{{ formatTime(r.created_at) }}</span>
@@ -1707,7 +1989,13 @@ onUnmounted(() => {
             <div class="card-meta">
               <div class="row-gap">
                 <span class="mood-badge">{{ note.mood || "日常" }}</span>
-                <span>{{ note.author_name }}</span>
+                <button
+                  type="button"
+                  class="user-link-btn"
+                  @click="openUserProfile(note.author_id)"
+                >
+                  {{ note.author_name }}
+                </button>
                 <span v-if="note.author_uid" class="uid-tag">#{{ note.author_uid }}</span>
               </div>
               <div class="row-gap">
@@ -1725,7 +2013,200 @@ onUnmounted(() => {
         </div>
       </section>
 
-      <!-- 4. 私密空间 -->
+      <!-- 4. 好友中心 -->
+      <section v-if="activeTab === 'friends'" class="glass-card">
+        <div class="section-header">
+          <div>
+            <h2 class="section-title">👥 好友与找人</h2>
+            <p class="section-sub">通过 UID、个人 ID 或用户名查找用户，查看对方主页并管理好友关系</p>
+          </div>
+          <button v-if="isLoggedIn" type="button" class="btn-mini" @click="fetchFriendsData">刷新</button>
+        </div>
+
+        <!-- 搜索用户框（访客也可搜索并查看他人主页） -->
+        <form class="row-gap" style="margin-bottom: 18px" @submit.prevent="handleSearchUsers">
+          <input
+            v-model="friendSearchQuery"
+            type="text"
+            class="field-input"
+            style="flex: 1"
+            placeholder="输入 UID（如 10001）、个人 ID 或用户名搜索..."
+          />
+          <button type="submit" class="btn-primary" style="white-space: nowrap" :disabled="searchingUsers">
+            {{ searchingUsers ? "搜索中..." : "搜索用户" }}
+          </button>
+        </form>
+
+        <div v-if="hasSearchedUsers" style="margin-bottom: 24px">
+          <h3 class="sub-heading">搜索结果（{{ friendSearchResults.length }} 人）</h3>
+          <div v-if="friendSearchResults.length === 0" class="empty-state">
+            没有找到匹配的用户，试试输入完整的 UID 或个人 ID
+          </div>
+          <div v-else class="friend-grid">
+            <div v-for="u in friendSearchResults" :key="u.id" class="friend-card">
+              <div class="row-gap" style="min-width: 0">
+                <button type="button" class="pyq-avatar clickable-avatar" @click="openUserProfile(u.id)">
+                  {{ getInitials(u.username) }}
+                </button>
+                <div style="min-width: 0">
+                  <div class="row-gap">
+                    <button type="button" class="user-link-btn" style="font-weight: 700; font-size: 15px" @click="openUserProfile(u.id)">
+                      {{ u.username }}
+                    </button>
+                    <span class="uid-tag">#{{ u.uid }}</span>
+                  </div>
+                  <div class="card-meta">个人 ID：{{ u.personal_id }}</div>
+                </div>
+              </div>
+
+              <div class="row-gap">
+                <button type="button" class="btn-mini" @click="openUserProfile(u.id)">主页</button>
+                <span v-if="u.relation === 'self'" class="card-meta">我自己</span>
+                <span v-else-if="u.relation === 'friends'" class="vis-badge public">✓ 已是好友</span>
+                <span v-else-if="u.relation === 'outgoing_pending'" class="vis-badge private">已申请</span>
+                <button
+                  v-else-if="u.relation === 'incoming_pending' && u.friendship_id"
+                  type="button"
+                  class="btn-ok-sm"
+                  :disabled="friendActionBusy"
+                  @click="handleAcceptFriend(u.friendship_id, u.id)"
+                >
+                  同意申请
+                </button>
+                <button
+                  v-else
+                  type="button"
+                  class="btn-primary"
+                  style="padding: 5px 12px; font-size: 12px"
+                  :disabled="friendActionBusy"
+                  @click="handleSendFriendRequest(u.id)"
+                >
+                  ＋ 加好友
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="!isLoggedIn" class="notice-bar">
+          <span>登录后即可添加好友、处理好友申请并管理你的好友列表</span>
+          <button type="button" class="btn-primary" @click="openAuthModal('login')">立即登录</button>
+        </div>
+
+        <div v-else class="col-gap" style="gap: 22px">
+          <!-- 收到的好友申请 -->
+          <div v-if="incomingRequests.length > 0">
+            <h3 class="sub-heading">📩 新的好友申请（{{ incomingRequests.length }}）</h3>
+            <div class="friend-grid">
+              <div v-for="req in incomingRequests" :key="req.friendship_id" class="friend-card">
+                <div class="row-gap">
+                  <button type="button" class="pyq-avatar clickable-avatar" @click="openUserProfile(req.id)">
+                    {{ getInitials(req.username) }}
+                  </button>
+                  <div>
+                    <div class="row-gap">
+                      <button type="button" class="user-link-btn" style="font-weight: 700" @click="openUserProfile(req.id)">
+                        {{ req.username }}
+                      </button>
+                      <span class="uid-tag">#{{ req.uid }}</span>
+                    </div>
+                    <div class="card-meta">申请于 {{ formatTime(req.created_at) }}</div>
+                  </div>
+                </div>
+                <div class="row-gap">
+                  <button
+                    type="button"
+                    class="btn-ok-sm"
+                    :disabled="friendActionBusy"
+                    @click="handleAcceptFriend(req.friendship_id, req.id)"
+                  >
+                    同意
+                  </button>
+                  <button
+                    type="button"
+                    class="btn-danger-sm"
+                    :disabled="friendActionBusy"
+                    @click="handleRemoveFriendship(req.friendship_id, req.id)"
+                  >
+                    拒绝
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 我发出的待确认申请 -->
+          <div v-if="outgoingRequests.length > 0">
+            <h3 class="sub-heading">⏳ 我发出的申请（{{ outgoingRequests.length }}）</h3>
+            <div class="friend-grid">
+              <div v-for="out in outgoingRequests" :key="out.friendship_id" class="friend-card">
+                <div class="row-gap">
+                  <button type="button" class="pyq-avatar clickable-avatar" @click="openUserProfile(out.id)">
+                    {{ getInitials(out.username) }}
+                  </button>
+                  <div>
+                    <div class="row-gap">
+                      <button type="button" class="user-link-btn" style="font-weight: 700" @click="openUserProfile(out.id)">
+                        {{ out.username }}
+                      </button>
+                      <span class="uid-tag">#{{ out.uid }}</span>
+                    </div>
+                    <div class="card-meta">等待对方确认</div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  class="btn-mini"
+                  :disabled="friendActionBusy"
+                  @click="handleRemoveFriendship(out.friendship_id, out.id)"
+                >
+                  取消申请
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 我的好友列表 -->
+          <div>
+            <h3 class="sub-heading">我的好友（{{ friendsList.length }} 人）</h3>
+            <div v-if="loadingFriends" class="empty-state">加载好友列表中...</div>
+            <div v-else-if="friendsList.length === 0" class="empty-state">
+              还没有好友，可以在上方搜索 UID/用户名，或在社区里点击他人昵称进入主页添加~
+            </div>
+            <div v-else class="friend-grid">
+              <div v-for="f in friendsList" :key="f.friendship_id" class="friend-card">
+                <div class="row-gap">
+                  <button type="button" class="pyq-avatar clickable-avatar" @click="openUserProfile(f.id)">
+                    {{ getInitials(f.username) }}
+                  </button>
+                  <div>
+                    <div class="row-gap">
+                      <button type="button" class="user-link-btn" style="font-weight: 700" @click="openUserProfile(f.id)">
+                        {{ f.username }}
+                      </button>
+                      <span class="uid-tag">#{{ f.uid }}</span>
+                    </div>
+                    <div class="card-meta">个人 ID：{{ f.personal_id }}</div>
+                  </div>
+                </div>
+                <div class="row-gap">
+                  <button type="button" class="btn-mini" @click="openUserProfile(f.id)">查看主页</button>
+                  <button
+                    type="button"
+                    class="btn-danger-sm"
+                    :disabled="friendActionBusy"
+                    @click="handleRemoveFriendship(f.friendship_id, f.id, `确认删除好友「${f.username}」吗？`)"
+                  >
+                    删除
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 5. 私密空间 -->
       <section v-if="activeTab === 'private_space'" class="glass-card">
         <div class="section-header">
           <div>
@@ -1792,7 +2273,7 @@ onUnmounted(() => {
         </div>
       </section>
 
-      <!-- 5. 用户中心 -->
+      <!-- 6. 用户中心 -->
       <section v-if="activeTab === 'profile' && isLoggedIn" class="glass-card">
         <div class="section-header">
           <div>
@@ -1800,6 +2281,9 @@ onUnmounted(() => {
             <p class="section-sub">管理你的专属 UID、个人 ID（限改 1 次）与显示用户名</p>
           </div>
           <div class="row-gap">
+            <button v-if="userId" type="button" class="btn-mini" @click="openUserProfile(userId)">
+              预览我的公开主页
+            </button>
             <span class="status-badge" :class="userStatus">{{ getStatusLabel(userStatus) }}</span>
             <span class="vis-badge" :class="isAdmin ? 'public' : 'private'">
               {{ isAdmin ? "🛡️ 管理员" : "普通用户" }}
@@ -2014,6 +2498,176 @@ onUnmounted(() => {
     </div>
   </div>
 
+  <!-- 他人个人主页弹窗 -->
+  <div v-if="loadingUserProfile || viewingProfile" class="modal-backdrop" @click="viewingProfile = null">
+    <div class="modal-box modal-wide" @click.stop>
+      <div v-if="loadingUserProfile" class="empty-state">加载用户主页中...</div>
+
+      <template v-else-if="viewingProfile">
+        <div class="section-header" style="margin-bottom: 0">
+          <div class="row-gap" style="gap: 14px">
+            <div class="hero-avatar" style="width: 56px; height: 56px; font-size: 20px; border-radius: 16px">
+              {{ getInitials(viewingProfile.user.username) }}
+            </div>
+            <div>
+              <div class="row-gap">
+                <h2 class="section-title" style="font-size: 20px">{{ viewingProfile.user.username }}</h2>
+                <span class="uid-tag">#{{ viewingProfile.user.uid }}</span>
+                <span v-if="viewingProfile.user.role === 'admin'" class="vis-badge public">🛡️ 管理员</span>
+              </div>
+              <div class="card-meta" style="margin-top: 4px">
+                <span>个人 ID：{{ viewingProfile.user.personal_id }}</span>
+                <span>· 加入于 {{ formatTime(viewingProfile.user.created_at) }}</span>
+              </div>
+            </div>
+          </div>
+          <button type="button" class="btn-ghost" @click="viewingProfile = null">关闭</button>
+        </div>
+
+        <!-- 个人数据统计 + 好友操作栏 -->
+        <div class="profile-banner">
+          <div class="row-gap" style="gap: 16px">
+            <div class="mini-stat">
+              <strong>{{ viewingProfile.posts.length }}</strong>
+              <span>公开帖子</span>
+            </div>
+            <div class="mini-stat">
+              <strong>{{ viewingProfile.notes.length }}</strong>
+              <span>公开日常</span>
+            </div>
+            <div class="mini-stat">
+              <strong>{{ viewingProfile.user.friend_count }}</strong>
+              <span>好友数</span>
+            </div>
+          </div>
+
+          <div class="row-gap">
+            <span v-if="viewingProfile.relation === 'self'" class="tag-chip">这是你自己的主页</span>
+            <template v-else-if="viewingProfile.relation === 'friends'">
+              <span class="vis-badge public">✓ 已是好友</span>
+              <button
+                type="button"
+                class="btn-danger-sm"
+                :disabled="friendActionBusy"
+                @click="
+                  handleRemoveFriendship(
+                    viewingProfile.friendship_id,
+                    viewingProfile.user.id,
+                    `确认解除与「${viewingProfile.user.username}」的好友关系吗？`
+                  )
+                "
+              >
+                删除好友
+              </button>
+            </template>
+            <template v-else-if="viewingProfile.relation === 'outgoing_pending'">
+              <span class="vis-badge private">⏳ 申请已发送</span>
+              <button
+                type="button"
+                class="btn-mini"
+                :disabled="friendActionBusy"
+                @click="handleRemoveFriendship(viewingProfile.friendship_id, viewingProfile.user.id)"
+              >
+                取消申请
+              </button>
+            </template>
+            <template v-else-if="viewingProfile.relation === 'incoming_pending'">
+              <button
+                type="button"
+                class="btn-ok-sm"
+                :disabled="friendActionBusy"
+                @click="
+                  viewingProfile.friendship_id &&
+                    handleAcceptFriend(viewingProfile.friendship_id, viewingProfile.user.id)
+                "
+              >
+                ✓ 同意好友申请
+              </button>
+              <button
+                type="button"
+                class="btn-danger-sm"
+                :disabled="friendActionBusy"
+                @click="handleRemoveFriendship(viewingProfile.friendship_id, viewingProfile.user.id)"
+              >
+                拒绝
+              </button>
+            </template>
+            <button
+              v-else
+              type="button"
+              class="btn-primary"
+              style="padding: 7px 14px; font-size: 13px"
+              :disabled="friendActionBusy"
+              @click="handleSendFriendRequest(viewingProfile.user.id)"
+            >
+              ＋ 添加好友
+            </button>
+          </div>
+        </div>
+
+        <!-- TA 的公开内容切换 -->
+        <div class="modal-tabs">
+          <button
+            type="button"
+            class="modal-tab"
+            :class="{ active: profileSubTab === 'posts' }"
+            @click="profileSubTab = 'posts'"
+          >
+            公开帖子 ({{ viewingProfile.posts.length }})
+          </button>
+          <button
+            type="button"
+            class="modal-tab"
+            :class="{ active: profileSubTab === 'notes' }"
+            @click="profileSubTab = 'notes'"
+          >
+            公开日常 ({{ viewingProfile.notes.length }})
+          </button>
+        </div>
+
+        <div v-if="profileSubTab === 'posts'">
+          <div v-if="viewingProfile.posts.length === 0" class="empty-state">
+            TA 还没有发布公开帖子
+          </div>
+          <div v-else class="feed-list">
+            <article
+              v-for="p in viewingProfile.posts"
+              :key="p.id"
+              class="moment-card"
+              style="cursor: pointer"
+              @click="readingPost = p"
+            >
+              <div class="card-meta">
+                <strong style="font-size: 15px; color: var(--text-main)">{{ p.title }}</strong>
+                <span>{{ formatTime(p.created_at) }}</span>
+              </div>
+              <p class="pyq-content clamped" style="font-size: 14px">{{ p.content }}</p>
+              <div class="card-meta">
+                <span>❤️ {{ p.like_count }} · 💬 {{ p.comment_count }}</span>
+                <span style="color: var(--accent)">点击阅读全文 →</span>
+              </div>
+            </article>
+          </div>
+        </div>
+
+        <div v-else>
+          <div v-if="viewingProfile.notes.length === 0" class="empty-state">
+            TA 还没有发布公开日常
+          </div>
+          <div v-else class="feed-list">
+            <div v-for="n in viewingProfile.notes" :key="n.id" class="moment-card">
+              <div class="card-meta">
+                <span class="mood-badge">{{ n.mood || "日常" }}</span>
+                <span>{{ formatTime(n.created_at) }}</span>
+              </div>
+              <p class="card-text">{{ n.content }}</p>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+
   <!-- 帖子全文弹窗 -->
   <div v-if="readingPost" class="modal-backdrop" @click="readingPost = null">
     <div class="modal-box modal-wide" @click.stop>
@@ -2026,7 +2680,13 @@ onUnmounted(() => {
           <span class="vis-badge" :class="readingPost.is_public ? 'public' : 'private'">
             {{ readingPost.is_public ? "🌐 社区公开" : "🔒 仅自己可见" }}
           </span>
-          <span>作者：{{ readingPost.author_name }}</span>
+          <button
+            type="button"
+            class="user-link-btn"
+            @click="openUserProfile(readingPost.author_id)"
+          >
+            作者：{{ readingPost.author_name }}
+          </button>
           <span v-if="readingPost.author_uid" class="uid-tag">#{{ readingPost.author_uid }}</span>
         </div>
         <span>发布于 {{ formatTime(readingPost.created_at) }}</span>
