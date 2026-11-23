@@ -55,7 +55,6 @@
   --shadow: 0 10px 30px rgba(15, 23, 42, 0.07);
 }
 
-/* 5 套整页背景色系（同步切换页面底色、渐变、卡片表面与主题色） */
 [data-palette="violet"] {
   --bg-base: #140a26;
   --bg-base-end: #241142;
@@ -316,7 +315,6 @@ button { cursor: pointer; }
 .link-btn { background: transparent; border: none; color: var(--accent); font-size: 13px; font-weight: 600; }
 .link-btn:hover { text-decoration: underline; }
 
-/* 社区信息流 */
 .pyq-feed, .feed-list { display: flex; flex-direction: column; gap: 15px; }
 .pyq-item {
   display: flex; gap: 14px; padding: 20px; border-radius: 18px;
@@ -377,7 +375,6 @@ button { cursor: pointer; }
 .field-input:disabled, .field-textarea:disabled { opacity: 0.6; cursor: not-allowed; }
 .field-textarea { resize: vertical; min-height: 96px; }
 
-/* 密码输入显隐开关 */
 .pwd-field { position: relative; width: 100%; }
 .pwd-field .field-input { padding-right: 42px; }
 .pwd-toggle {
@@ -423,7 +420,6 @@ button { cursor: pointer; }
   background: var(--danger-bg); color: var(--danger); font-size: 12px; font-weight: 600;
 }
 
-/* 点赞、评论区与楼中楼 */
 .like-btn.liked {
   border-color: var(--danger); background: var(--danger-bg); color: var(--danger); font-weight: 600;
 }
@@ -504,7 +500,6 @@ button { cursor: pointer; }
   color: var(--text-subtle); border-top: 1px solid var(--border);
 }
 
-/* UID / 个人 ID / 注册成功提示与密码规则 */
 .uid-tag {
   display: inline-block; padding: 2px 8px; border-radius: 6px;
   font-size: 12px; font-weight: 700; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -528,7 +523,6 @@ button { cursor: pointer; }
 }
 .pwd-rules .ok { color: var(--public); font-weight: 600; }
 
-/* 独立 /admin 管理控制台风格（同步跟随背景色系） */
 .console-shell {
   min-height: 100vh; display: grid; grid-template-columns: 240px minmax(0, 1fr); background: transparent;
 }
