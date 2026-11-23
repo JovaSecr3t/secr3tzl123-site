@@ -17,6 +17,7 @@ interface UserRow {
   uid: number;
   personal_id: string;
   personal_id_changed: number;
+  personal_id_updated_at: string | null;
   username: string;
   email: string | null;
   role: string;
@@ -30,7 +31,9 @@ interface AuthUser {
   id: string;
   uid: number;
   personal_id: string;
-  personal_id_changed: boolean;
+  personal_id_updated_at: string | null;
+  can_change_personal_id: boolean;
+  next_personal_id_change_at: string | null;
   username: string;
   email: string | null;
   role: UserRole;
@@ -85,11 +88,44 @@ interface FriendshipRow {
   updated_at: string;
 }
 
+interface AnnouncementRow {
+  id: string;
+  title: string;
+  content: string;
+  is_pinned: number;
+  author_id: string;
+  author_name: string;
+  created_at: string;
+}
+
+interface NotificationRow {
+  id: string;
+  user_id: string;
+  actor_id: string;
+  actor_name: string;
+  actor_uid: number | null;
+  type: string;
+  target_id: string | null;
+  preview: string;
+  is_read: number;
+  created_at: string;
+}
+
+interface DirectMessageRow {
+  id: string;
+  sender_id: string;
+  receiver_id: string;
+  content: string;
+  is_read: number;
+  created_at: string;
+}
+
 interface JwtPayload {
   sub?: string;
   exp?: number;
 }
 
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -142,6 +178,20 @@ function normalizeRole(role?: string | null): UserRole {
 function normalizeStatus(status?: string | null): UserStatus {
   if (status === "disabled" || status === "banned") return status;
   return "active";
+}
+
+function computePersonalIdCooldown(updatedAt: string | null | undefined): {
+  canChange: boolean;
+  nextChangeAt: string | null;
+} {
+  if (!updatedAt) return { canChange: true, nextChangeAt: null };
+  const lastMs = Date.parse(updatedAt);
+  if (Number.isNaN(lastMs)) return { canChange: true, nextChangeAt: null };
+  const nextMs = lastMs + SEVEN_DAYS_MS;
+  if (Date.now() >= nextMs) {
+    return { canChange: true, nextChangeAt: null };
+  }
+  return { canChange: false, nextChangeAt: new Date(nextMs).toISOString() };
 }
 
 function validateUsername(username: string): string | null {
@@ -235,17 +285,20 @@ async function getCurrentUser(
 
   const user = await db
     .prepare(
-      "SELECT id, uid, personal_id, personal_id_changed, username, email, role, status FROM users WHERE id = ?"
+      "SELECT id, uid, personal_id, personal_id_changed, personal_id_updated_at, username, email, role, status FROM users WHERE id = ?"
     )
     .bind(userId)
     .first<UserRow>();
   if (!user) return null;
 
+  const cooldown = computePersonalIdCooldown(user.personal_id_updated_at);
   return {
     id: user.id,
     uid: user.uid,
     personal_id: user.personal_id || user.id,
-    personal_id_changed: Boolean(user.personal_id_changed),
+    personal_id_updated_at: user.personal_id_updated_at || null,
+    can_change_personal_id: cooldown.canChange,
+    next_personal_id_change_at: cooldown.nextChangeAt,
     username: user.username,
     email: user.email || null,
     role: normalizeRole(user.role),
@@ -273,6 +326,37 @@ async function generateNextUserUid(db: D1Database): Promise<number> {
 
 function generatePersonalId(): string {
   return `u_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+}
+
+async function createNotification(
+  db: D1Database,
+  params: {
+    userId: string;
+    actorId: string;
+    type: "like_post" | "like_comment" | "comment_post" | "reply_comment" | "dm";
+    targetId: string | null;
+    preview: string;
+  }
+): Promise<void> {
+  if (!params.userId || params.userId === params.actorId) return;
+  try {
+    await db
+      .prepare(
+        "INSERT INTO notifications (id, user_id, actor_id, type, target_id, preview, is_read, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)"
+      )
+      .bind(
+        crypto.randomUUID(),
+        params.userId,
+        params.actorId,
+        params.type,
+        params.targetId,
+        params.preview.slice(0, 120),
+        new Date().toISOString()
+      )
+      .run();
+  } catch {
+    // 通知写入异常不影响主业务流程
+  }
 }
 
 async function getRelationBetween(
@@ -324,7 +408,9 @@ export const onRequest: PagesFunction<Env> = async (context) => {
             id: null,
             uid: null,
             personal_id: null,
-            personal_id_changed: false,
+            personal_id_updated_at: null,
+            can_change_personal_id: false,
+            next_personal_id_change_at: null,
             username: null,
             email: null,
             role: "user",
@@ -373,7 +459,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         const createdAt = new Date().toISOString();
 
         await env.DB.prepare(
-          "INSERT INTO users (id, uid, personal_id, personal_id_changed, username, email, role, status, password_hash, salt, created_at) VALUES (?, ?, ?, 0, ?, ?, 'user', 'active', ?, ?, ?)"
+          "INSERT INTO users (id, uid, personal_id, personal_id_changed, personal_id_updated_at, username, email, role, status, password_hash, salt, created_at) VALUES (?, ?, ?, 0, NULL, ?, ?, 'user', 'active', ?, ?, ?)"
         )
           .bind(id, uid, id, username, email, passwordHash, salt, createdAt)
           .run();
@@ -383,7 +469,9 @@ export const onRequest: PagesFunction<Env> = async (context) => {
           id,
           uid,
           personal_id: id,
-          personal_id_changed: false,
+          personal_id_updated_at: null,
+          can_change_personal_id: true,
+          next_personal_id_change_at: null,
           username,
           email,
           role: "user",
@@ -402,7 +490,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 
         const numericUid = /^\d+$/.test(account) ? Number(account) : -1;
         const user = await env.DB.prepare(
-          "SELECT id, uid, personal_id, personal_id_changed, username, email, role, status, password_hash, salt FROM users WHERE uid = ? OR LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?) OR LOWER(personal_id) = LOWER(?)"
+          "SELECT id, uid, personal_id, personal_id_updated_at, username, email, role, status, password_hash, salt FROM users WHERE uid = ? OR LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?) OR LOWER(personal_id) = LOWER(?)"
         )
           .bind(numericUid, account, account, account)
           .first<UserRow>();
@@ -421,12 +509,15 @@ export const onRequest: PagesFunction<Env> = async (context) => {
           return jsonRes({ error: "该账号已被封号，无法登录，请联系管理员解禁" }, 403);
         }
 
+        const cooldown = computePersonalIdCooldown(user.personal_id_updated_at);
         const token = await signToken(user.id, secret);
         return jsonRes({
           id: user.id,
           uid: user.uid,
           personal_id: user.personal_id || user.id,
-          personal_id_changed: Boolean(user.personal_id_changed),
+          personal_id_updated_at: user.personal_id_updated_at || null,
+          can_change_personal_id: cooldown.canChange,
+          next_personal_id_change_at: cooldown.nextChangeAt,
           username: user.username,
           email: user.email || null,
           role: normalizeRole(user.role),
@@ -436,7 +527,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       }
     }
 
-    // 2. 个人资料修改：/api/user/*
+    // 2. 个人资料修改（7 天内可改一次个人 ID）：/api/user/*
     if (segments[0] === "user") {
       const currentUser = await getCurrentUser(env.DB, request, secret);
       const errRes = checkPermission(currentUser);
@@ -468,13 +559,26 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       }
 
       if (segments[1] === "personal-id" && method === "PATCH") {
-        if (currentUser.personal_id_changed) {
-          return jsonRes({ error: "个人 ID 只能修改一次，您已使用过修改机会" }, 403);
+        const cooldown = computePersonalIdCooldown(currentUser.personal_id_updated_at);
+        if (!cooldown.canChange && cooldown.nextChangeAt) {
+          const remainMs = Math.max(0, Date.parse(cooldown.nextChangeAt) - Date.now());
+          const remainDays = Math.floor(remainMs / (24 * 60 * 60 * 1000));
+          const remainHours = Math.ceil((remainMs % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
+          return jsonRes(
+            {
+              error: `个人 ID 每 7 天仅可修改一次，还需等待约 ${remainDays} 天 ${remainHours} 小时`,
+            },
+            403
+          );
         }
+
         const body = await readJsonBody(request);
         const nextId = String(body.personal_id || "").trim();
         if (!/^[a-zA-Z0-9_-]{3,24}$/.test(nextId)) {
           return jsonRes({ error: "个人 ID 需为 3~24 位字母、数字、下划线或短横线" }, 400);
+        }
+        if (nextId === currentUser.personal_id) {
+          return jsonRes({ error: "新的个人 ID 与当前相同" }, 400);
         }
 
         const conflict = await env.DB.prepare(
@@ -484,21 +588,256 @@ export const onRequest: PagesFunction<Env> = async (context) => {
           .first<{ id: string }>();
         if (conflict) return jsonRes({ error: "该个人 ID 已被占用，请更换" }, 409);
 
+        const nowIso = new Date().toISOString();
+        const nextIso = new Date(Date.now() + SEVEN_DAYS_MS).toISOString();
         await env.DB.prepare(
-          "UPDATE users SET personal_id = ?, personal_id_changed = 1 WHERE id = ?"
+          "UPDATE users SET personal_id = ?, personal_id_changed = 1, personal_id_updated_at = ? WHERE id = ?"
         )
-          .bind(nextId, currentUser.id)
+          .bind(nextId, nowIso, currentUser.id)
           .run();
-        return jsonRes({ ok: true, personal_id: nextId, personal_id_changed: true });
+
+        return jsonRes({
+          ok: true,
+          personal_id: nextId,
+          personal_id_updated_at: nowIso,
+          can_change_personal_id: false,
+          next_personal_id_change_at: nextIso,
+        });
       }
     }
 
-    // 3. 搜索用户与查看他人公开主页：/api/users/*
+    // 3. 站点公告（前台读取 + 管理员发布/置顶/删除）：/api/announcements/*
+    if (segments[0] === "announcements") {
+      if (!segments[1] && method === "GET") {
+        const { results } = await env.DB.prepare(
+          "SELECT a.id, a.title, a.content, a.is_pinned, a.author_id, COALESCE(u.username, '管理员') AS author_name, a.created_at FROM announcements a LEFT JOIN users u ON a.author_id = u.id ORDER BY a.is_pinned DESC, a.created_at DESC"
+        ).all<AnnouncementRow>();
+        return jsonRes(
+          results.map((r) => ({
+            ...r,
+            is_pinned: Boolean(r.is_pinned),
+          }))
+        );
+      }
+
+      const currentUser = await getCurrentUser(env.DB, request, secret);
+      const errRes = checkPermission(currentUser);
+      if (errRes || !currentUser) return errRes ?? jsonRes({ error: "请先登录" }, 401);
+      if (currentUser.role !== "admin") return jsonRes({ error: "仅管理员可管理公告" }, 403);
+
+      if (!segments[1] && method === "POST") {
+        const body = await readJsonBody(request);
+        const title = String(body.title || "").trim();
+        const content = String(body.content || "").trim();
+        if (!title || !content) return jsonRes({ error: "公告标题和内容不能为空" }, 400);
+
+        const id = crypto.randomUUID();
+        const createdAt = new Date().toISOString();
+        const isPinnedInt = body.is_pinned === false ? 0 : 1;
+
+        await env.DB.prepare(
+          "INSERT INTO announcements (id, title, content, is_pinned, author_id, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+        )
+          .bind(id, title, content, isPinnedInt, currentUser.id, createdAt)
+          .run();
+
+        return jsonRes({
+          id,
+          title,
+          content,
+          is_pinned: Boolean(isPinnedInt),
+          author_id: currentUser.id,
+          author_name: currentUser.username,
+          created_at: createdAt,
+        });
+      }
+
+      if (segments[1] && method === "PATCH") {
+        const body = await readJsonBody(request);
+        const isPinnedInt = body.is_pinned ? 1 : 0;
+        await env.DB.prepare("UPDATE announcements SET is_pinned = ? WHERE id = ?")
+          .bind(isPinnedInt, segments[1])
+          .run();
+        return jsonRes({ ok: true, is_pinned: Boolean(isPinnedInt) });
+      }
+
+      if (segments[1] && method === "DELETE") {
+        await env.DB.prepare("DELETE FROM announcements WHERE id = ?").bind(segments[1]).run();
+        return jsonRes({ ok: true });
+      }
+    }
+
+    // 4. 站内消息提醒（点赞 / 评论 / 私聊）：/api/notifications/*
+    if (segments[0] === "notifications") {
+      const currentUser = await getCurrentUser(env.DB, request, secret);
+      const errRes = checkPermission(currentUser, true);
+      if (errRes || !currentUser) return errRes ?? jsonRes({ error: "请先登录" }, 401);
+
+      if (!segments[1] && method === "GET") {
+        const [listRes, unreadNotif, unreadDm] = await Promise.all([
+          env.DB.prepare(
+            "SELECT n.id, n.user_id, n.actor_id, COALESCE(u.username, '某位用户') AS actor_name, u.uid AS actor_uid, n.type, n.target_id, n.preview, n.is_read, n.created_at FROM notifications n LEFT JOIN users u ON n.actor_id = u.id WHERE n.user_id = ? ORDER BY n.created_at DESC LIMIT 50"
+          )
+            .bind(currentUser.id)
+            .all<NotificationRow>(),
+          env.DB.prepare(
+            "SELECT COUNT(*) AS c FROM notifications WHERE user_id = ? AND is_read = 0"
+          )
+            .bind(currentUser.id)
+            .first<{ c: number }>(),
+          env.DB.prepare(
+            "SELECT COUNT(*) AS c FROM direct_messages WHERE receiver_id = ? AND is_read = 0"
+          )
+            .bind(currentUser.id)
+            .first<{ c: number }>(),
+        ]);
+
+        return jsonRes({
+          unread_count: Number(unreadNotif?.c || 0),
+          unread_dm_count: Number(unreadDm?.c || 0),
+          items: listRes.results.map((r) => ({
+            ...r,
+            is_read: Boolean(r.is_read),
+          })),
+        });
+      }
+
+      if (segments[1] === "read-all" && method === "POST") {
+        await env.DB.prepare("UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0")
+          .bind(currentUser.id)
+          .run();
+        return jsonRes({ ok: true });
+      }
+
+      if (segments[1] && segments[2] === "read" && method === "POST") {
+        await env.DB.prepare("UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?")
+          .bind(segments[1], currentUser.id)
+          .run();
+        return jsonRes({ ok: true });
+      }
+    }
+
+    // 5. 私聊系统（仅限好友之间）：/api/messages/*
+    if (segments[0] === "messages") {
+      const currentUser = await getCurrentUser(env.DB, request, secret);
+      const errRes = checkPermission(currentUser, method === "GET");
+      if (errRes || !currentUser) return errRes ?? jsonRes({ error: "请先登录" }, 401);
+
+      // 5.1 获取私聊会话摘要（每个好友的最新一条消息与未读数）
+      if (segments[1] === "conversations" && method === "GET") {
+        const { results } = await env.DB.prepare(
+          "SELECT u.id AS peer_id, u.uid AS peer_uid, u.personal_id AS peer_personal_id, u.username AS peer_name, (SELECT content FROM direct_messages m WHERE (m.sender_id = ? AND m.receiver_id = u.id) OR (m.sender_id = u.id AND m.receiver_id = ?) ORDER BY m.created_at DESC LIMIT 1) AS last_content, (SELECT created_at FROM direct_messages m WHERE (m.sender_id = ? AND m.receiver_id = u.id) OR (m.sender_id = u.id AND m.receiver_id = ?) ORDER BY m.created_at DESC LIMIT 1) AS last_time, (SELECT COUNT(*) FROM direct_messages m WHERE m.sender_id = u.id AND m.receiver_id = ? AND m.is_read = 0) AS unread_count FROM friendships f JOIN users u ON u.id = CASE WHEN f.requester_id = ? THEN f.addressee_id ELSE f.requester_id END WHERE f.status = 'accepted' AND (f.requester_id = ? OR f.addressee_id = ?) ORDER BY COALESCE(last_time, f.updated_at) DESC"
+        )
+          .bind(
+            currentUser.id,
+            currentUser.id,
+            currentUser.id,
+            currentUser.id,
+            currentUser.id,
+            currentUser.id,
+            currentUser.id,
+            currentUser.id
+          )
+          .all<{
+            peer_id: string;
+            peer_uid: number;
+            peer_personal_id: string;
+            peer_name: string;
+            last_content: string | null;
+            last_time: string | null;
+            unread_count: number;
+          }>();
+
+        return jsonRes(
+          results.map((r) => ({
+            ...r,
+            unread_count: Number(r.unread_count || 0),
+          }))
+        );
+      }
+
+      // 5.2 获取与指定好友的聊天记录（同时将该好友发来的未读消息标为已读）
+      if (segments[1] && !segments[2] && method === "GET") {
+        const peerId = segments[1];
+        const rel = await getRelationBetween(env.DB, currentUser.id, peerId);
+        if (rel.relation !== "friends") {
+          return jsonRes({ error: "你们还不是好友，添加好友后即可私聊" }, 403);
+        }
+
+        await env.DB.prepare(
+          "UPDATE direct_messages SET is_read = 1 WHERE sender_id = ? AND receiver_id = ? AND is_read = 0"
+        )
+          .bind(peerId, currentUser.id)
+          .run();
+
+        await env.DB.prepare(
+          "UPDATE notifications SET is_read = 1 WHERE user_id = ? AND actor_id = ? AND type = 'dm' AND is_read = 0"
+        )
+          .bind(currentUser.id, peerId)
+          .run();
+
+        const { results } = await env.DB.prepare(
+          "SELECT id, sender_id, receiver_id, content, is_read, created_at FROM direct_messages WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?) ORDER BY created_at ASC LIMIT 100"
+        )
+          .bind(currentUser.id, peerId, peerId, currentUser.id)
+          .all<DirectMessageRow>();
+
+        return jsonRes(
+          results.map((m) => ({
+            ...m,
+            is_read: Boolean(m.is_read),
+            is_mine: m.sender_id === currentUser.id,
+          }))
+        );
+      }
+
+      // 5.3 发送私聊消息给好友
+      if (segments[1] && !segments[2] && method === "POST") {
+        const peerId = segments[1];
+        const rel = await getRelationBetween(env.DB, currentUser.id, peerId);
+        if (rel.relation !== "friends") {
+          return jsonRes({ error: "仅支持向已添加的好友发送私聊消息" }, 403);
+        }
+
+        const body = await readJsonBody(request);
+        const content = String(body.content || "").trim();
+        if (!content || content.length > 1000) {
+          return jsonRes({ error: "私聊内容需为 1~1000 字" }, 400);
+        }
+
+        const id = crypto.randomUUID();
+        const createdAt = new Date().toISOString();
+        await env.DB.prepare(
+          "INSERT INTO direct_messages (id, sender_id, receiver_id, content, is_read, created_at) VALUES (?, ?, ?, ?, 0, ?)"
+        )
+          .bind(id, currentUser.id, peerId, content, createdAt)
+          .run();
+
+        await createNotification(env.DB, {
+          userId: peerId,
+          actorId: currentUser.id,
+          type: "dm",
+          targetId: currentUser.id,
+          preview: `${currentUser.username} 发来私聊：${content}`,
+        });
+
+        return jsonRes({
+          id,
+          sender_id: currentUser.id,
+          receiver_id: peerId,
+          content,
+          is_read: false,
+          is_mine: true,
+          created_at: createdAt,
+        });
+      }
+    }
+
+    // 6. 搜索用户与查看他人公开主页：/api/users/*
     if (segments[0] === "users") {
       const rawUser = await getCurrentUser(env.DB, request, secret);
       const currentUser = rawUser && rawUser.status !== "banned" ? rawUser : null;
 
-      // 3.1 搜索用户（按 UID / 个人 ID / 用户名）
       if (segments[1] === "search" && method === "GET") {
         const url = new URL(request.url);
         const q = (url.searchParams.get("q") || "").trim();
@@ -533,7 +872,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         return jsonRes(enriched);
       }
 
-      // 3.2 查看他人个人主页（公开资料 + 公开帖子 + 公开日常 + 好友关系）
       if (segments[1] && !segments[2] && method === "GET") {
         const targetKey = decodeURIComponent(segments[1]).trim();
         const numericUid = /^\d+$/.test(targetKey) ? Number(targetKey) : -1;
@@ -599,13 +937,12 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       }
     }
 
-    // 4. 好友系统：/api/friends/*
+    // 7. 好友系统：/api/friends/*
     if (segments[0] === "friends") {
       const currentUser = await getCurrentUser(env.DB, request, secret);
       const errRes = checkPermission(currentUser, method === "GET");
       if (errRes || !currentUser) return errRes ?? jsonRes({ error: "请先登录" }, 401);
 
-      // 4.1 获取好友列表、收到的申请、发出的申请
       if (!segments[1] && method === "GET") {
         const { results } = await env.DB.prepare(
           "SELECT f.id AS friendship_id, f.requester_id, f.addressee_id, f.status, f.created_at AS req_time, u.id AS user_id, u.uid, u.personal_id, u.username, u.role, u.status AS user_status FROM friendships f JOIN users u ON u.id = CASE WHEN f.requester_id = ? THEN f.addressee_id ELSE f.requester_id END WHERE f.requester_id = ? OR f.addressee_id = ? ORDER BY f.updated_at DESC"
@@ -652,7 +989,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         return jsonRes({ friends, incoming, outgoing });
       }
 
-      // 4.2 发送好友申请（支持 target_user_id 或 account）
       if (segments[1] === "request" && method === "POST") {
         const body = await readJsonBody(request);
         const rawTarget = String(body.target_user_id || body.account || "").trim();
@@ -690,7 +1026,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
           if (existing.requester_id === currentUser.id) {
             return jsonRes({ error: "已发送过好友申请，请等待对方确认" }, 409);
           }
-          // 如果对方正好之前向我发过申请，直接互相同意成为好友
           await env.DB.prepare(
             "UPDATE friendships SET status = 'accepted', updated_at = ? WHERE id = ?"
           )
@@ -700,7 +1035,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
             ok: true,
             relation: "friends",
             friendship_id: existing.id,
-            message: `对方之前已向你发出申请，已自动成为好友`,
+            message: "对方之前已向你发出申请，已自动成为好友",
           });
         }
 
@@ -719,7 +1054,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         });
       }
 
-      // 4.3 同意好友申请
       if (segments[1] && segments[2] === "accept" && method === "POST") {
         const friendshipId = segments[1];
         const row = await env.DB.prepare(
@@ -739,7 +1073,6 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         return jsonRes({ ok: true, relation: "friends" });
       }
 
-      // 4.4 拒绝 / 取消申请 / 删除好友
       if (segments[1] && !segments[2] && method === "DELETE") {
         const friendshipId = segments[1];
         const row = await env.DB.prepare(
@@ -756,7 +1089,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       }
     }
 
-    // 5. 管理员后台：/api/admin/*
+    // 8. 管理员后台：/api/admin/*
     if (segments[0] === "admin") {
       if (segments[1] === "status" && method === "GET") {
         const existingAdmin = await env.DB.prepare(
@@ -798,7 +1131,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         const createdAt = new Date().toISOString();
 
         await env.DB.prepare(
-          "INSERT INTO users (id, uid, personal_id, personal_id_changed, username, email, role, status, password_hash, salt, created_at) VALUES (?, ?, ?, 0, 'admin', ?, 'admin', 'active', ?, ?, ?)"
+          "INSERT INTO users (id, uid, personal_id, personal_id_changed, personal_id_updated_at, username, email, role, status, password_hash, salt, created_at) VALUES (?, ?, ?, 0, NULL, 'admin', ?, 'admin', 'active', ?, ?, ?)"
         )
           .bind(id, uid, id, email, passwordHash, salt, createdAt)
           .run();
@@ -808,7 +1141,9 @@ export const onRequest: PagesFunction<Env> = async (context) => {
           id,
           uid,
           personal_id: id,
-          personal_id_changed: false,
+          personal_id_updated_at: null,
+          can_change_personal_id: true,
+          next_personal_id_change_at: null,
           username: "admin",
           email,
           role: "admin",
@@ -882,7 +1217,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       }
     }
 
-    // 6. 社区帖子、点赞、楼中楼评论与评论点赞：/api/posts/*
+    // 9. 社区帖子、点赞、楼中楼评论与评论点赞（带站内提醒）：/api/posts/*
     if (segments[0] === "posts") {
       const rawUser = await getCurrentUser(env.DB, request, secret);
       const currentUser = rawUser && rawUser.status !== "banned" ? rawUser : null;
@@ -893,10 +1228,10 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 
         const postId = segments[1];
         const post = await env.DB.prepare(
-          "SELECT id, is_public, author_id FROM posts WHERE id = ?"
+          "SELECT id, title, is_public, author_id FROM posts WHERE id = ?"
         )
           .bind(postId)
-          .first<{ id: string; is_public: number; author_id: string }>();
+          .first<{ id: string; title: string; is_public: number; author_id: string }>();
         if (!post) return jsonRes({ error: "帖子不存在" }, 404);
         if (!post.is_public && post.author_id !== rawUser.id) {
           return jsonRes({ error: "无权操作该帖子" }, 403);
@@ -920,6 +1255,14 @@ export const onRequest: PagesFunction<Env> = async (context) => {
             .bind(postId, rawUser.id, new Date().toISOString())
             .run();
           liked = true;
+
+          await createNotification(env.DB, {
+            userId: post.author_id,
+            actorId: rawUser.id,
+            type: "like_post",
+            targetId: post.id,
+            preview: `${rawUser.username} 赞了你的帖子《${post.title}》`,
+          });
         }
 
         const cnt = await env.DB.prepare(
@@ -943,10 +1286,10 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         const postId = segments[1];
         const commentId = segments[3];
         const comment = await env.DB.prepare(
-          "SELECT id FROM post_comments WHERE id = ? AND post_id = ?"
+          "SELECT id, user_id, content FROM post_comments WHERE id = ? AND post_id = ?"
         )
           .bind(commentId, postId)
-          .first<{ id: string }>();
+          .first<{ id: string; user_id: string; content: string }>();
         if (!comment) return jsonRes({ error: "评论不存在" }, 404);
 
         const existed = await env.DB.prepare(
@@ -967,6 +1310,14 @@ export const onRequest: PagesFunction<Env> = async (context) => {
             .bind(commentId, rawUser.id, new Date().toISOString())
             .run();
           liked = true;
+
+          await createNotification(env.DB, {
+            userId: comment.user_id,
+            actorId: rawUser.id,
+            type: "like_comment",
+            targetId: postId,
+            preview: `${rawUser.username} 赞了你的评论：${comment.content}`,
+          });
         }
 
         const cnt = await env.DB.prepare(
@@ -1012,10 +1363,10 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         if (errRes || !rawUser) return errRes ?? jsonRes({ error: "请先登录" }, 401);
 
         const post = await env.DB.prepare(
-          "SELECT id, is_public, author_id FROM posts WHERE id = ?"
+          "SELECT id, title, is_public, author_id FROM posts WHERE id = ?"
         )
           .bind(segments[1])
-          .first<{ id: string; is_public: number; author_id: string }>();
+          .first<{ id: string; title: string; is_public: number; author_id: string }>();
         if (!post) return jsonRes({ error: "帖子不存在" }, 404);
         if (!post.is_public && post.author_id !== rawUser.id) {
           return jsonRes({ error: "无权评论该帖子" }, 403);
@@ -1029,15 +1380,18 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 
         let effectiveParentId: string | null = null;
         let replyToName: string | null = null;
+        let repliedUserId: string | null = null;
+
         if (body.parent_id) {
           const parentRow = await env.DB.prepare(
-            "SELECT id, parent_id FROM post_comments WHERE id = ? AND post_id = ?"
+            "SELECT id, parent_id, user_id FROM post_comments WHERE id = ? AND post_id = ?"
           )
             .bind(String(body.parent_id), segments[1])
-            .first<{ id: string; parent_id: string | null }>();
+            .first<{ id: string; parent_id: string | null; user_id: string }>();
           if (!parentRow) return jsonRes({ error: "要回复的评论不存在或已被删除" }, 404);
           effectiveParentId = parentRow.parent_id || parentRow.id;
           replyToName = String(body.reply_to_name || "").trim() || null;
+          repliedUserId = body.reply_to_user_id ? String(body.reply_to_user_id) : parentRow.user_id;
         }
 
         const id = crypto.randomUUID();
@@ -1047,6 +1401,26 @@ export const onRequest: PagesFunction<Env> = async (context) => {
         )
           .bind(id, segments[1], effectiveParentId, replyToName, rawUser.id, content, createdAt)
           .run();
+
+        // 通知被回复的人 + 通知帖子作者
+        if (repliedUserId) {
+          await createNotification(env.DB, {
+            userId: repliedUserId,
+            actorId: rawUser.id,
+            type: "reply_comment",
+            targetId: post.id,
+            preview: `${rawUser.username} 回复了你的评论：${content}`,
+          });
+        }
+        if (post.author_id !== repliedUserId) {
+          await createNotification(env.DB, {
+            userId: post.author_id,
+            actorId: rawUser.id,
+            type: "comment_post",
+            targetId: post.id,
+            preview: `${rawUser.username} 评论了你的帖子《${post.title}》：${content}`,
+          });
+        }
 
         return jsonRes({
           id,
@@ -1209,7 +1583,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       }
     }
 
-    // 7. 日常动态：/api/notes/*
+    // 10. 日常动态：/api/notes/*
     if (segments[0] === "notes") {
       const rawUser = await getCurrentUser(env.DB, request, secret);
       const currentUser = rawUser && rawUser.status !== "banned" ? rawUser : null;

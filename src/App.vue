@@ -1,10 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 
 type ThemeMode = "dark" | "light";
 type PaletteKey = "ocean" | "violet" | "emerald" | "sunset" | "rose";
-type FrontendTab = "home" | "community" | "moments" | "friends" | "private_space" | "profile";
-type AdminSubTab = "users" | "posts";
+type FrontendTab =
+  | "home"
+  | "community"
+  | "moments"
+  | "friends"
+  | "messages"
+  | "notifications"
+  | "private_space"
+  | "profile";
+type AdminSubTab = "users" | "posts" | "announcements";
 type AuthMode = "login" | "register";
 type UserRole = "admin" | "user";
 type UserStatus = "active" | "disabled" | "banned";
@@ -25,7 +33,9 @@ interface AuthSessionResponse {
   id: string | null;
   uid: number | null;
   personal_id?: string | null;
-  personal_id_changed?: boolean;
+  personal_id_updated_at?: string | null;
+  can_change_personal_id?: boolean;
+  next_personal_id_change_at?: string | null;
   username: string | null;
   email: string | null;
   role: UserRole;
@@ -41,6 +51,49 @@ interface AdminUserItem {
   email: string | null;
   role: UserRole;
   status: UserStatus;
+  created_at: string;
+}
+
+interface AnnouncementItem {
+  id: string;
+  title: string;
+  content: string;
+  is_pinned: boolean;
+  author_id: string;
+  author_name: string;
+  created_at: string;
+}
+
+interface NotificationItem {
+  id: string;
+  user_id: string;
+  actor_id: string;
+  actor_name: string;
+  actor_uid: number | null;
+  type: "like_post" | "like_comment" | "comment_post" | "reply_comment" | "dm";
+  target_id: string | null;
+  preview: string;
+  is_read: boolean;
+  created_at: string;
+}
+
+interface ConversationItem {
+  peer_id: string;
+  peer_uid: number;
+  peer_personal_id: string;
+  peer_name: string;
+  last_content: string | null;
+  last_time: string | null;
+  unread_count: number;
+}
+
+interface DirectMessageItem {
+  id: string;
+  sender_id: string;
+  receiver_id: string;
+  content: string;
+  is_read: boolean;
+  is_mine: boolean;
   created_at: string;
 }
 
@@ -139,6 +192,7 @@ interface RegSuccessInfo {
 interface ReplyTarget {
   parentId: string;
   replyToName: string;
+  replyToUserId: string;
 }
 
 interface PwdChecks {
@@ -181,7 +235,8 @@ const pwdVisible = ref({
 const userId = ref<string | null>(null);
 const userUid = ref<number | null>(null);
 const userPersonalId = ref<string>("");
-const personalIdChanged = ref<boolean>(false);
+const canChangePersonalId = ref<boolean>(true);
+const nextPersonalIdChangeAt = ref<string | null>(null);
 const userEmail = ref<string | null>(null);
 const userName = ref<string>("");
 const userRole = ref<UserRole>("user");
@@ -212,6 +267,29 @@ const adminRegConfirm = ref<string>("");
 const adminUsers = ref<AdminUserItem[]>([]);
 const adminTotalUsers = ref<number>(0);
 const loadingAdmin = ref<boolean>(false);
+
+// 站点公告
+const announcements = ref<AnnouncementItem[]>([]);
+const announceTitle = ref<string>("");
+const announceContent = ref<string>("");
+const announcePinned = ref<boolean>(true);
+const publishingAnnounce = ref<boolean>(false);
+const activeAnnouncement = ref<AnnouncementItem | null>(null);
+
+// 站内消息提醒
+const notifications = ref<NotificationItem[]>([]);
+const unreadNotifCount = ref<number>(0);
+const unreadDmCount = ref<number>(0);
+const loadingNotifications = ref<boolean>(false);
+
+// 私聊系统
+const conversations = ref<ConversationItem[]>([]);
+const activeChatPeer = ref<{ id: string; uid: number; name: string } | null>(null);
+const chatMessages = ref<DirectMessageItem[]>([]);
+const loadingChat = ref<boolean>(false);
+const dmInput = ref<string>("");
+const sendingDm = ref<boolean>(false);
+const chatBoxRef = ref<HTMLElement | null>(null);
 
 // 用户中心与社区数据
 const profileNameInput = ref<string>("");
@@ -266,6 +344,13 @@ const isDisabledUser = computed<boolean>(
 );
 const displayCurrentUser = computed<string>(() =>
   isLoggedIn.value ? userName.value || "用户" : "访客"
+);
+
+const pinnedAnnouncements = computed<AnnouncementItem[]>(() =>
+  announcements.value.filter((a) => a.is_pinned)
+);
+const latestBannerAnnouncement = computed<AnnouncementItem | null>(
+  () => pinnedAnnouncements.value[0] || announcements.value[0] || null
 );
 
 const publicPosts = computed<PostItem[]>(() => posts.value.filter((p) => p.is_public));
@@ -361,6 +446,12 @@ function getStatusLabel(status: UserStatus): string {
   return "正常";
 }
 
+function getNotifTypeLabel(type: NotificationItem["type"]): string {
+  if (type === "like_post" || type === "like_comment") return "❤️ 收到点赞";
+  if (type === "comment_post" || type === "reply_comment") return "💬 收到评论";
+  return "✉️ 新私聊";
+}
+
 async function copyText(val: string | number | null, label: string): Promise<void> {
   const str = String(val ?? "");
   try {
@@ -376,7 +467,8 @@ function applyUserSession(res: AuthSessionResponse): void {
   userId.value = res.id || null;
   userUid.value = res.uid ?? null;
   userPersonalId.value = res.personal_id || res.id || "";
-  personalIdChanged.value = Boolean(res.personal_id_changed);
+  canChangePersonalId.value = res.can_change_personal_id ?? true;
+  nextPersonalIdChangeAt.value = res.next_personal_id_change_at || null;
   userName.value = res.username || "";
   userEmail.value = res.email || null;
   userRole.value = res.role || "user";
@@ -390,7 +482,8 @@ function clearUserSession(): void {
   userId.value = null;
   userUid.value = null;
   userPersonalId.value = "";
-  personalIdChanged.value = false;
+  canChangePersonalId.value = true;
+  nextPersonalIdChangeAt.value = null;
   userName.value = "";
   userEmail.value = null;
   userRole.value = "user";
@@ -400,6 +493,12 @@ function clearUserSession(): void {
   friendsList.value = [];
   incomingRequests.value = [];
   outgoingRequests.value = [];
+  notifications.value = [];
+  unreadNotifCount.value = 0;
+  unreadDmCount.value = 0;
+  conversations.value = [];
+  activeChatPeer.value = null;
+  chatMessages.value = [];
 }
 
 async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -417,12 +516,139 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   return data;
 }
 
+async function fetchAnnouncements(): Promise<void> {
+  try {
+    announcements.value = await apiFetch<AnnouncementItem[]>("/api/announcements");
+  } catch {
+    // 忽略公告加载异常
+  }
+}
+
+async function fetchNotifications(): Promise<void> {
+  if (!isLoggedIn.value) return;
+  try {
+    const res = await apiFetch<{
+      unread_count: number;
+      unread_dm_count: number;
+      items: NotificationItem[];
+    }>("/api/notifications");
+    notifications.value = res.items || [];
+    unreadNotifCount.value = res.unread_count || 0;
+    unreadDmCount.value = res.unread_dm_count || 0;
+  } catch {
+    // 轮询失败静默忽略
+  }
+}
+
+async function handleMarkAllNotificationsRead(): Promise<void> {
+  try {
+    await apiFetch<{ ok: boolean }>("/api/notifications/read-all", { method: "POST" });
+    notifications.value.forEach((n) => {
+      n.is_read = true;
+    });
+    unreadNotifCount.value = 0;
+    showNotice("已全部标记为已读");
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "操作失败"));
+  }
+}
+
+async function handleClickNotification(item: NotificationItem): Promise<void> {
+  if (!item.is_read) {
+    item.is_read = true;
+    unreadNotifCount.value = Math.max(0, unreadNotifCount.value - 1);
+    void apiFetch(`/api/notifications/${item.id}/read`, { method: "POST" }).catch(() => {});
+  }
+
+  if (item.type === "dm") {
+    const peerId = item.target_id || item.actor_id;
+    await openDirectChat(peerId, item.actor_name, item.actor_uid ?? 0);
+    return;
+  }
+
+  if (item.target_id) {
+    const targetPost = posts.value.find((p) => p.id === item.target_id);
+    if (targetPost) {
+      activeTab.value = "community";
+      readingPost.value = targetPost;
+      await toggleCommentsPanel(targetPost.id);
+    } else {
+      activeTab.value = "community";
+    }
+  }
+}
+
+async function fetchConversations(): Promise<void> {
+  if (!isLoggedIn.value) return;
+  try {
+    conversations.value = await apiFetch<ConversationItem[]>("/api/messages/conversations");
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "获取会话列表失败"));
+  }
+}
+
+function scrollChatToBottom(): void {
+  void nextTick(() => {
+    if (chatBoxRef.value) {
+      chatBoxRef.value.scrollTop = chatBoxRef.value.scrollHeight;
+    }
+  });
+}
+
+async function openDirectChat(peerId: string, peerName: string, peerUid: number): Promise<void> {
+  if (!isLoggedIn.value) {
+    openAuthModal("login");
+    authMsg.value = "请先登录后再发送私聊";
+    return;
+  }
+  viewingProfile.value = null;
+  activeTab.value = "messages";
+  activeChatPeer.value = { id: peerId, uid: peerUid, name: peerName };
+  loadingChat.value = true;
+  try {
+    chatMessages.value = await apiFetch<DirectMessageItem[]>(
+      `/api/messages/${encodeURIComponent(peerId)}`
+    );
+    await Promise.all([fetchConversations(), fetchNotifications()]);
+    scrollChatToBottom();
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "打开私聊失败"));
+  } finally {
+    loadingChat.value = false;
+  }
+}
+
+async function handleSendDirectMessage(): Promise<void> {
+  if (!activeChatPeer.value) return;
+  const content = dmInput.value.trim();
+  if (!content) return;
+  sendingDm.value = true;
+  try {
+    const msg = await apiFetch<DirectMessageItem>(
+      `/api/messages/${encodeURIComponent(activeChatPeer.value.id)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ content }),
+      }
+    );
+    chatMessages.value.push(msg);
+    dmInput.value = "";
+    scrollChatToBottom();
+    await fetchConversations();
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "发送失败"));
+  } finally {
+    sendingDm.value = false;
+  }
+}
+
 async function fetchAllData(): Promise<void> {
   loadingData.value = true;
   try {
     const [postsData, notesData] = await Promise.all([
       apiFetch<PostItem[]>("/api/posts"),
       apiFetch<NoteItem[]>("/api/notes"),
+      fetchAnnouncements(),
     ]);
     posts.value = postsData;
     notes.value = notesData;
@@ -540,8 +766,8 @@ async function handleAcceptFriend(friendshipId: string, targetUserId?: string): 
     }
     const found = friendSearchResults.value.find((u) => u.friendship_id === friendshipId);
     if (found) found.relation = "friends";
-    showNotice("已同意好友申请");
-    await fetchFriendsData();
+    showNotice("已同意好友申请，现在可以私聊了");
+    await Promise.all([fetchFriendsData(), fetchConversations()]);
   } catch (err: unknown) {
     showNotice(getErrorMessage(err, "操作失败"));
   } finally {
@@ -571,13 +797,17 @@ async function handleRemoveFriendship(
       viewingProfile.value.relation = "none";
       viewingProfile.value.friendship_id = null;
     }
+    if (targetUserId && activeChatPeer.value?.id === targetUserId) {
+      activeChatPeer.value = null;
+      chatMessages.value = [];
+    }
     const found = friendSearchResults.value.find((u) => u.friendship_id === friendshipId);
     if (found) {
       found.relation = "none";
       found.friendship_id = null;
     }
     showNotice("已更新好友关系");
-    await fetchFriendsData();
+    await Promise.all([fetchFriendsData(), fetchConversations()]);
   } catch (err: unknown) {
     showNotice(getErrorMessage(err, "操作失败"));
   } finally {
@@ -594,7 +824,7 @@ async function checkSession(): Promise<void> {
     const res = await apiFetch<AuthSessionResponse>("/api/auth/me");
     if (res.id) {
       applyUserSession(res);
-      await fetchFriendsData();
+      await Promise.all([fetchFriendsData(), fetchNotifications(), fetchConversations()]);
     } else {
       clearUserSession();
     }
@@ -635,6 +865,7 @@ function syncRoute(): void {
   authMsg.value = "";
   if (isAdminRoute.value) {
     void fetchAdminStatus();
+    void fetchAnnouncements();
     if (isAdmin.value) void fetchAdminUsers();
   }
 }
@@ -730,7 +961,12 @@ async function handleFrontendAuth(): Promise<void> {
     applyUserSession(res);
     passwordInput.value = "";
     confirmPasswordInput.value = "";
-    await Promise.all([fetchAllData(), fetchFriendsData()]);
+    await Promise.all([
+      fetchAllData(),
+      fetchFriendsData(),
+      fetchNotifications(),
+      fetchConversations(),
+    ]);
 
     if (isLogin) {
       showAuthModal.value = false;
@@ -815,6 +1051,54 @@ async function handleAdminRegister(): Promise<void> {
   }
 }
 
+async function handlePublishAnnouncement(): Promise<void> {
+  if (!announceTitle.value.trim() || !announceContent.value.trim()) return;
+  publishingAnnounce.value = true;
+  try {
+    const created = await apiFetch<AnnouncementItem>("/api/announcements", {
+      method: "POST",
+      body: JSON.stringify({
+        title: announceTitle.value.trim(),
+        content: announceContent.value.trim(),
+        is_pinned: announcePinned.value,
+      }),
+    });
+    announcements.value.unshift(created);
+    announceTitle.value = "";
+    announceContent.value = "";
+    showNotice("站点公告已发布");
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "发布公告失败"));
+  } finally {
+    publishingAnnounce.value = false;
+  }
+}
+
+async function handleToggleAnnouncementPin(item: AnnouncementItem): Promise<void> {
+  const nextPinned = !item.is_pinned;
+  try {
+    await apiFetch<{ ok: boolean; is_pinned: boolean }>(`/api/announcements/${item.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ is_pinned: nextPinned }),
+    });
+    item.is_pinned = nextPinned;
+    showNotice(nextPinned ? "已置顶该公告" : "已取消置顶");
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "操作失败"));
+  }
+}
+
+async function handleDeleteAnnouncement(id: string): Promise<void> {
+  try {
+    await apiFetch<{ ok: boolean }>(`/api/announcements/${id}`, { method: "DELETE" });
+    announcements.value = announcements.value.filter((a) => a.id !== id);
+    if (activeAnnouncement.value?.id === id) activeAnnouncement.value = null;
+    showNotice("已删除公告");
+  } catch (err: unknown) {
+    showNotice(getErrorMessage(err, "删除失败"));
+  }
+}
+
 async function handleLogout(): Promise<void> {
   clearUserSession();
   openCommentPostId.value = null;
@@ -824,7 +1108,9 @@ async function handleLogout(): Promise<void> {
   if (
     activeTab.value === "private_space" ||
     activeTab.value === "profile" ||
-    activeTab.value === "friends"
+    activeTab.value === "friends" ||
+    activeTab.value === "messages" ||
+    activeTab.value === "notifications"
   ) {
     activeTab.value = "home";
   }
@@ -931,7 +1217,7 @@ async function toggleCommentsPanel(postId: string): Promise<void> {
   }
 }
 
-function startReply(rootId: string, targetName: string): void {
+function startReply(rootId: string, targetName: string, targetUserId: string): void {
   if (!isLoggedIn.value) {
     openAuthModal("login");
     authMsg.value = "请先登录后再回复评论";
@@ -941,7 +1227,7 @@ function startReply(rootId: string, targetName: string): void {
     showNotice("您的账号已被禁用，暂无法回复评论");
     return;
   }
-  replyTarget.value = { parentId: rootId, replyToName: targetName };
+  replyTarget.value = { parentId: rootId, replyToName: targetName, replyToUserId: targetUserId };
 }
 
 async function handleSubmitComment(post: PostItem): Promise<void> {
@@ -954,10 +1240,16 @@ async function handleSubmitComment(post: PostItem): Promise<void> {
   if (!content) return;
   submittingComment.value = true;
   try {
-    const payload: { content: string; parent_id?: string; reply_to_name?: string } = { content };
+    const payload: {
+      content: string;
+      parent_id?: string;
+      reply_to_name?: string;
+      reply_to_user_id?: string;
+    } = { content };
     if (replyTarget.value) {
       payload.parent_id = replyTarget.value.parentId;
       payload.reply_to_name = replyTarget.value.replyToName;
+      payload.reply_to_user_id = replyTarget.value.replyToUserId;
     }
     const created = await apiFetch<CommentItem>(`/api/posts/${post.id}/comments`, {
       method: "POST",
@@ -1092,22 +1384,25 @@ async function handleUpdatePersonalId(): Promise<void> {
     showNotice("个人 ID 需为 3~24 位字母、数字、下划线或短横线");
     return;
   }
-  if (!window.confirm(`确认将个人 ID 修改为「${nextId}」吗？修改后将无法再次更改。`)) {
+  if (!window.confirm(`确认将个人 ID 修改为「${nextId}」吗？修改后需等待 7 天才可再次修改。`)) {
     return;
   }
   savingPersonalId.value = true;
   try {
-    const res = await apiFetch<{ ok: boolean; personal_id: string; personal_id_changed: boolean }>(
-      "/api/user/personal-id",
-      {
-        method: "PATCH",
-        body: JSON.stringify({ personal_id: nextId }),
-      }
-    );
+    const res = await apiFetch<{
+      ok: boolean;
+      personal_id: string;
+      can_change_personal_id: boolean;
+      next_personal_id_change_at: string | null;
+    }>("/api/user/personal-id", {
+      method: "PATCH",
+      body: JSON.stringify({ personal_id: nextId }),
+    });
     userPersonalId.value = res.personal_id;
-    personalIdChanged.value = true;
+    canChangePersonalId.value = res.can_change_personal_id;
+    nextPersonalIdChangeAt.value = res.next_personal_id_change_at;
     profileIdInput.value = res.personal_id;
-    showNotice("个人 ID 修改成功（唯一修改机会已使用）");
+    showNotice("个人 ID 修改成功（7 天后可再次修改）");
   } catch (err: unknown) {
     showNotice(getErrorMessage(err, "修改个人 ID 失败"));
   } finally {
@@ -1163,6 +1458,8 @@ async function handleSetUserStatus(
 }
 
 let timer: number | null = null;
+let pollTimer: number | null = null;
+
 onMounted(async () => {
   const savedTheme = localStorage.getItem("secr3tzl_theme");
   theme.value = savedTheme === "light" ? "light" : "dark";
@@ -1183,6 +1480,21 @@ onMounted(async () => {
   updateClock();
   timer = window.setInterval(updateClock, 1000);
 
+  // 每 12 秒轮询新通知与当前打开的私聊窗口
+  pollTimer = window.setInterval(async () => {
+    if (!isLoggedIn.value) return;
+    await fetchNotifications();
+    if (activeTab.value === "messages" && activeChatPeer.value) {
+      const latest = await apiFetch<DirectMessageItem[]>(
+        `/api/messages/${encodeURIComponent(activeChatPeer.value.id)}`
+      ).catch(() => null);
+      if (latest && latest.length !== chatMessages.value.length) {
+        chatMessages.value = latest;
+        scrollChatToBottom();
+      }
+    }
+  }, 12000);
+
   window.addEventListener("popstate", syncRoute);
   await checkSession();
   await fetchAllData();
@@ -1194,6 +1506,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (timer !== null) window.clearInterval(timer);
+  if (pollTimer !== null) window.clearInterval(pollTimer);
   window.removeEventListener("popstate", syncRoute);
 });
 </script>
@@ -1218,6 +1531,14 @@ onUnmounted(() => {
           @click="adminSubTab = 'users'; fetchAdminUsers()"
         >
           👥 用户与风控管理
+        </button>
+        <button
+          type="button"
+          class="console-nav-item"
+          :class="{ active: adminSubTab === 'announcements' }"
+          @click="adminSubTab = 'announcements'; fetchAnnouncements()"
+        >
+          📢 站点公告管理
         </button>
         <button
           type="button"
@@ -1270,6 +1591,8 @@ onUnmounted(() => {
                 ? "权限不足"
                 : adminSubTab === "users"
                 ? "全部用户、UID 与封禁管理"
+                : adminSubTab === "announcements"
+                ? "全站公告发布与置顶管理"
                 : "社区公开内容审核"
             }}
           </h1>
@@ -1415,11 +1738,12 @@ onUnmounted(() => {
             <strong class="stat-num" style="color: var(--danger)">{{ restrictedUsersCount }}</strong>
           </div>
           <div class="console-metric-card">
-            <span class="stat-label">社区公开帖子</span>
-            <strong class="stat-num">{{ publicPosts.length }}</strong>
+            <span class="stat-label">全站公告数</span>
+            <strong class="stat-num">{{ announcements.length }}</strong>
           </div>
         </div>
 
+        <!-- 3.1 用户管理 -->
         <div v-if="adminSubTab === 'users'" class="console-panel">
           <div class="section-header">
             <div>
@@ -1513,6 +1837,71 @@ onUnmounted(() => {
           </div>
         </div>
 
+        <!-- 3.2 站点公告管理 -->
+        <div v-if="adminSubTab === 'announcements'" class="console-panel">
+          <div class="section-header">
+            <div>
+              <h3 class="section-title">📢 发布站点公告</h3>
+              <p class="section-sub">置顶公告将展示在社区前台首页最上方横幅，所有访客可见</p>
+            </div>
+          </div>
+
+          <form class="composer-form" @submit.prevent="handlePublishAnnouncement">
+            <input
+              v-model="announceTitle"
+              type="text"
+              class="field-input"
+              placeholder="输入公告标题..."
+            />
+            <textarea
+              v-model="announceContent"
+              class="field-textarea"
+              placeholder="输入公告正文内容..."
+            />
+            <div class="mood-bar">
+              <button
+                type="button"
+                class="btn-mini"
+                @click="announcePinned = !announcePinned"
+              >
+                {{ announcePinned ? "📌 默认置顶首页" : "📄 普通公告" }}
+              </button>
+              <button
+                type="submit"
+                class="btn-primary"
+                :disabled="publishingAnnounce || !announceTitle.trim() || !announceContent.trim()"
+              >
+                {{ publishingAnnounce ? "发布中..." : "发布公告" }}
+              </button>
+            </div>
+          </form>
+
+          <div v-if="announcements.length === 0" class="empty-state">暂无站点公告</div>
+          <div v-else class="feed-list">
+            <div v-for="a in announcements" :key="a.id" class="moment-card">
+              <div class="card-meta">
+                <div class="row-gap">
+                  <span class="vis-badge" :class="a.is_pinned ? 'public' : 'private'">
+                    {{ a.is_pinned ? "📌 置顶中" : "普通公告" }}
+                  </span>
+                  <strong style="color: var(--text-main); font-size: 15px">{{ a.title }}</strong>
+                </div>
+                <div class="row-gap">
+                  <span>{{ formatTime(a.created_at) }}</span>
+                  <button type="button" class="btn-mini" @click="handleToggleAnnouncementPin(a)">
+                    {{ a.is_pinned ? "取消置顶" : "设为置顶" }}
+                  </button>
+                  <button type="button" class="btn-danger-sm" @click="handleDeleteAnnouncement(a.id)">
+                    删除
+                  </button>
+                </div>
+              </div>
+              <p class="card-text">{{ a.content }}</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- 3.3 社区帖子审核 -->
         <div v-if="adminSubTab === 'posts'" class="console-panel">
           <div class="section-header">
             <div>
@@ -1576,7 +1965,7 @@ onUnmounted(() => {
             社区
           </button>
           <button type="button" class="nav-pill" :class="{ active: activeTab === 'moments' }" @click="activeTab = 'moments'">
-            日常动态
+            日常
           </button>
           <button
             type="button"
@@ -1587,8 +1976,28 @@ onUnmounted(() => {
             👥 好友
             <span v-if="incomingRequests.length > 0" class="badge-dot">{{ incomingRequests.length }}</span>
           </button>
+          <button
+            v-if="isLoggedIn"
+            type="button"
+            class="nav-pill"
+            :class="{ active: activeTab === 'messages' }"
+            @click="activeTab = 'messages'; fetchConversations()"
+          >
+            💬 私聊
+            <span v-if="unreadDmCount > 0" class="badge-dot">{{ unreadDmCount }}</span>
+          </button>
+          <button
+            v-if="isLoggedIn"
+            type="button"
+            class="nav-pill"
+            :class="{ active: activeTab === 'notifications' }"
+            @click="activeTab = 'notifications'; fetchNotifications()"
+          >
+            🔔 提醒
+            <span v-if="unreadNotifCount > 0" class="badge-dot">{{ unreadNotifCount }}</span>
+          </button>
           <button type="button" class="nav-pill" :class="{ active: activeTab === 'private_space' }" @click="activeTab = 'private_space'">
-            🔒 私密空间
+            🔒 私密
           </button>
           <button
             v-if="isLoggedIn"
@@ -1600,13 +2009,13 @@ onUnmounted(() => {
             用户中心
           </button>
           <button v-if="isAdmin" type="button" class="nav-pill" @click="goToPath('/admin')">
-            🛡️ 管理后台
+            🛡️ 后台
           </button>
         </nav>
 
         <div class="nav-actions">
           <button type="button" class="upload-blog-btn" @click="openPostModal(true)">
-            ＋ 发布帖子
+            ＋ 发帖
           </button>
           <div class="palette-picker" title="切换整页背景色系">
             <button
@@ -1624,7 +2033,7 @@ onUnmounted(() => {
             {{ theme === "dark" ? "☀️" : "🌙" }}
           </button>
           <button v-if="isLoggedIn" type="button" class="icon-btn" @click="handleLogout">
-            退出 ({{ displayCurrentUser }})
+            退出
           </button>
           <button v-else type="button" class="icon-btn" @click="openAuthModal('login')">
             登录 / 注册
@@ -1642,6 +2051,20 @@ onUnmounted(() => {
         <span>{{ toastMsg }}</span>
       </div>
 
+      <!-- 置顶公告横幅 -->
+      <div
+        v-if="latestBannerAnnouncement"
+        class="announce-banner"
+        @click="activeAnnouncement = latestBannerAnnouncement"
+      >
+        <div class="row-gap" style="min-width: 0">
+          <span class="vis-badge public">📢 站点公告</span>
+          <strong class="announce-banner-title">{{ latestBannerAnnouncement.title }}</strong>
+          <span class="announce-banner-preview">{{ latestBannerAnnouncement.content }}</span>
+        </div>
+        <span class="link-btn" style="white-space: nowrap">查看详情 →</span>
+      </div>
+
       <!-- 1. 首页 -->
       <template v-if="activeTab === 'home'">
         <section class="hero-grid">
@@ -1650,7 +2073,7 @@ onUnmounted(() => {
               <div class="hero-avatar">{{ getInitials(displayCurrentUser) }}</div>
               <div>
                 <h1 class="hero-title">欢迎您，{{ displayCurrentUser }}</h1>
-                <p class="hero-subtitle">社区交流、日常动态、好友互动与私密空间</p>
+                <p class="hero-subtitle">社区交流、日常动态、好友私聊与私密空间</p>
               </div>
             </div>
             <div class="tag-row">
@@ -1684,14 +2107,14 @@ onUnmounted(() => {
           <div class="section-header">
             <div>
               <h2 class="section-title">社区 · 最新帖子</h2>
-              <p class="section-sub">点击用户昵称可查看对方个人主页并添加好友</p>
+              <p class="section-sub">点击用户昵称可查看对方个人主页、添加好友或发起私聊</p>
             </div>
             <button type="button" class="link-btn" @click="activeTab = 'community'">进入社区 →</button>
           </div>
 
           <div v-if="loadingData" class="empty-state">加载中...</div>
           <div v-else-if="publicPosts.length === 0" class="empty-state">
-            社区还没有帖子，点击右上角「＋ 发布帖子」发第一条吧~
+            社区还没有帖子，点击右上角「＋ 发帖」发第一条吧~
           </div>
           <div v-else class="blog-grid">
             <article v-for="post in publicPosts.slice(0, 4)" :key="post.id" class="blog-card" @click="readingPost = post">
@@ -1844,7 +2267,7 @@ onUnmounted(() => {
                         >
                           {{ c.liked_by_me ? "❤️" : "🤍" }} {{ c.like_count }}
                         </button>
-                        <button type="button" class="btn-mini" @click="startReply(c.id, c.author_name)">
+                        <button type="button" class="btn-mini" @click="startReply(c.id, c.author_name, c.user_id)">
                           回复
                         </button>
                         <button
@@ -1884,7 +2307,7 @@ onUnmounted(() => {
                             >
                               {{ r.liked_by_me ? "❤️" : "🤍" }} {{ r.like_count }}
                             </button>
-                            <button type="button" class="btn-mini" @click="startReply(c.id, r.author_name)">
+                            <button type="button" class="btn-mini" @click="startReply(c.id, r.author_name, r.user_id)">
                               回复
                             </button>
                             <button
@@ -2018,12 +2441,11 @@ onUnmounted(() => {
         <div class="section-header">
           <div>
             <h2 class="section-title">👥 好友与找人</h2>
-            <p class="section-sub">通过 UID、个人 ID 或用户名查找用户，查看对方主页并管理好友关系</p>
+            <p class="section-sub">通过 UID、个人 ID 或用户名查找用户，互为好友后可直接发起私聊</p>
           </div>
           <button v-if="isLoggedIn" type="button" class="btn-mini" @click="fetchFriendsData">刷新</button>
         </div>
 
-        <!-- 搜索用户框（访客也可搜索并查看他人主页） -->
         <form class="row-gap" style="margin-bottom: 18px" @submit.prevent="handleSearchUsers">
           <input
             v-model="friendSearchQuery"
@@ -2062,7 +2484,15 @@ onUnmounted(() => {
               <div class="row-gap">
                 <button type="button" class="btn-mini" @click="openUserProfile(u.id)">主页</button>
                 <span v-if="u.relation === 'self'" class="card-meta">我自己</span>
-                <span v-else-if="u.relation === 'friends'" class="vis-badge public">✓ 已是好友</span>
+                <button
+                  v-else-if="u.relation === 'friends'"
+                  type="button"
+                  class="btn-primary"
+                  style="padding: 5px 12px; font-size: 12px"
+                  @click="openDirectChat(u.id, u.username, u.uid)"
+                >
+                  💬 私聊
+                </button>
                 <span v-else-if="u.relation === 'outgoing_pending'" class="vis-badge private">已申请</span>
                 <button
                   v-else-if="u.relation === 'incoming_pending' && u.friendship_id"
@@ -2089,12 +2519,11 @@ onUnmounted(() => {
         </div>
 
         <div v-if="!isLoggedIn" class="notice-bar">
-          <span>登录后即可添加好友、处理好友申请并管理你的好友列表</span>
+          <span>登录后即可添加好友、处理好友申请并开启好友私聊</span>
           <button type="button" class="btn-primary" @click="openAuthModal('login')">立即登录</button>
         </div>
 
         <div v-else class="col-gap" style="gap: 22px">
-          <!-- 收到的好友申请 -->
           <div v-if="incomingRequests.length > 0">
             <h3 class="sub-heading">📩 新的好友申请（{{ incomingRequests.length }}）</h3>
             <div class="friend-grid">
@@ -2135,7 +2564,6 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <!-- 我发出的待确认申请 -->
           <div v-if="outgoingRequests.length > 0">
             <h3 class="sub-heading">⏳ 我发出的申请（{{ outgoingRequests.length }}）</h3>
             <div class="friend-grid">
@@ -2166,7 +2594,6 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <!-- 我的好友列表 -->
           <div>
             <h3 class="sub-heading">我的好友（{{ friendsList.length }} 人）</h3>
             <div v-if="loadingFriends" class="empty-state">加载好友列表中...</div>
@@ -2190,7 +2617,15 @@ onUnmounted(() => {
                   </div>
                 </div>
                 <div class="row-gap">
-                  <button type="button" class="btn-mini" @click="openUserProfile(f.id)">查看主页</button>
+                  <button
+                    type="button"
+                    class="btn-primary"
+                    style="padding: 5px 12px; font-size: 12px"
+                    @click="openDirectChat(f.id, f.username, f.uid)"
+                  >
+                    💬 私聊
+                  </button>
+                  <button type="button" class="btn-mini" @click="openUserProfile(f.id)">主页</button>
                   <button
                     type="button"
                     class="btn-danger-sm"
@@ -2206,7 +2641,156 @@ onUnmounted(() => {
         </div>
       </section>
 
-      <!-- 5. 私密空间 -->
+      <!-- 5. 好友私聊 -->
+      <section v-if="activeTab === 'messages' && isLoggedIn" class="glass-card">
+        <div class="section-header">
+          <div>
+            <h2 class="section-title">💬 好友私聊</h2>
+            <p class="section-sub">仅支持与已互为好友的用户一对一私聊</p>
+          </div>
+          <button type="button" class="btn-mini" @click="fetchConversations">刷新会话</button>
+        </div>
+
+        <div class="dm-layout">
+          <!-- 左侧好友会话列表 -->
+          <div class="dm-sidebar">
+            <div v-if="conversations.length === 0" class="empty-state" style="padding: 20px 10px">
+              暂无可私聊的好友，先去「👥 好友」添加好友吧~
+            </div>
+            <button
+              v-for="conv in conversations"
+              :key="conv.peer_id"
+              type="button"
+              class="dm-peer-item"
+              :class="{ active: activeChatPeer?.id === conv.peer_id }"
+              @click="openDirectChat(conv.peer_id, conv.peer_name, conv.peer_uid)"
+            >
+              <div class="pyq-avatar" style="width: 38px; height: 38px; font-size: 13px">
+                {{ getInitials(conv.peer_name) }}
+              </div>
+              <div style="flex: 1; min-width: 0; text-align: left">
+                <div class="card-meta" style="margin-bottom: 2px">
+                  <strong style="color: var(--text-main); font-size: 14px">{{ conv.peer_name }}</strong>
+                  <span v-if="conv.unread_count > 0" class="badge-dot">{{ conv.unread_count }}</span>
+                </div>
+                <div class="dm-preview">
+                  {{ conv.last_content || "点击开始发消息..." }}
+                </div>
+              </div>
+            </button>
+          </div>
+
+          <!-- 右侧聊天窗口 -->
+          <div class="dm-window">
+            <div v-if="!activeChatPeer" class="empty-state" style="margin: auto">
+              从左侧选择一位好友开始私聊
+            </div>
+            <template v-else>
+              <div class="dm-window-header">
+                <div class="row-gap">
+                  <button
+                    type="button"
+                    class="user-link-btn"
+                    style="font-weight: 700; font-size: 15px"
+                    @click="openUserProfile(activeChatPeer.id)"
+                  >
+                    {{ activeChatPeer.name }}
+                  </button>
+                  <span class="uid-tag">#{{ activeChatPeer.uid }}</span>
+                </div>
+                <button type="button" class="btn-mini" @click="openUserProfile(activeChatPeer.id)">
+                  查看主页
+                </button>
+              </div>
+
+              <div ref="chatBoxRef" class="dm-messages">
+                <div v-if="loadingChat" class="empty-state">加载聊天记录中...</div>
+                <div v-else-if="chatMessages.length === 0" class="empty-state">
+                  还没有聊天记录，发条消息打个招呼吧~
+                </div>
+                <div
+                  v-for="m in chatMessages"
+                  :key="m.id"
+                  class="dm-bubble-row"
+                  :class="{ mine: m.is_mine }"
+                >
+                  <div class="dm-bubble" :class="{ mine: m.is_mine }">
+                    <div class="dm-bubble-text">{{ m.content }}</div>
+                    <div class="dm-bubble-time">{{ formatTime(m.created_at) }}</div>
+                  </div>
+                </div>
+              </div>
+
+              <form class="comment-form" style="padding-top: 10px" @submit.prevent="handleSendDirectMessage">
+                <input
+                  v-model="dmInput"
+                  type="text"
+                  maxlength="1000"
+                  class="field-input"
+                  :disabled="isDisabledUser"
+                  :placeholder="isDisabledUser ? '账号已被禁用，暂无法发送私聊' : `发消息给 ${activeChatPeer.name}...`"
+                />
+                <button
+                  type="submit"
+                  class="btn-primary"
+                  style="white-space: nowrap; padding: 8px 16px"
+                  :disabled="sendingDm || !dmInput.trim() || isDisabledUser"
+                >
+                  {{ sendingDm ? "发送中" : "发送" }}
+                </button>
+              </form>
+            </template>
+          </div>
+        </div>
+      </section>
+
+      <!-- 6. 消息提醒中心 -->
+      <section v-if="activeTab === 'notifications' && isLoggedIn" class="glass-card">
+        <div class="section-header">
+          <div>
+            <h2 class="section-title">🔔 消息提醒中心</h2>
+            <p class="section-sub">收到新评论、回复、点赞与私聊消息都会实时汇总在这里</p>
+          </div>
+          <div class="row-gap">
+            <button
+              v-if="unreadNotifCount > 0"
+              type="button"
+              class="btn-mini"
+              @click="handleMarkAllNotificationsRead"
+            >
+              全部标为已读
+            </button>
+            <button type="button" class="btn-mini" @click="fetchNotifications">刷新</button>
+          </div>
+        </div>
+
+        <div v-if="loadingNotifications" class="empty-state">加载提醒中...</div>
+        <div v-else-if="notifications.length === 0" class="empty-state">
+          暂时还没有收到任何提醒~
+        </div>
+        <div v-else class="feed-list">
+          <div
+            v-for="item in notifications"
+            :key="item.id"
+            class="moment-card notif-item"
+            :class="{ unread: !item.is_read }"
+            @click="handleClickNotification(item)"
+          >
+            <div class="card-meta">
+              <div class="row-gap">
+                <span v-if="!item.is_read" class="unread-dot" />
+                <span class="mood-badge">{{ getNotifTypeLabel(item.type) }}</span>
+                <strong>{{ item.actor_name }}</strong>
+                <span v-if="item.actor_uid" class="uid-tag">#{{ item.actor_uid }}</span>
+              </div>
+              <span>{{ formatTime(item.created_at) }}</span>
+            </div>
+            <p class="card-text" style="font-size: 14px">{{ item.preview }}</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 7. 私密空间 -->
       <section v-if="activeTab === 'private_space'" class="glass-card">
         <div class="section-header">
           <div>
@@ -2273,12 +2857,12 @@ onUnmounted(() => {
         </div>
       </section>
 
-      <!-- 6. 用户中心 -->
+      <!-- 8. 用户中心 -->
       <section v-if="activeTab === 'profile' && isLoggedIn" class="glass-card">
         <div class="section-header">
           <div>
             <h2 class="section-title">用户中心</h2>
-            <p class="section-sub">管理你的专属 UID、个人 ID（限改 1 次）与显示用户名</p>
+            <p class="section-sub">管理你的专属 UID、个人 ID（每 7 天可修改 1 次）与显示用户名</p>
           </div>
           <div class="row-gap">
             <button v-if="userId" type="button" class="btn-mini" @click="openUserProfile(userId)">
@@ -2302,8 +2886,8 @@ onUnmounted(() => {
             <button type="button" class="btn-mini" @click="copyText(userPersonalId, '个人 ID')">复制 ID</button>
           </div>
 
-          <div v-if="personalIdChanged" class="card-meta">
-            🔒 个人 ID 已修改过 1 次，无法再次更改
+          <div v-if="!canChangePersonalId && nextPersonalIdChangeAt" class="card-meta">
+            ⏳ 个人 ID 每 7 天可修改一次，下次可修改时间：{{ formatTime(nextPersonalIdChangeAt) }}
           </div>
           <form v-else class="row-gap" style="margin-top: 2px" @submit.prevent="handleUpdatePersonalId">
             <input
@@ -2313,7 +2897,7 @@ onUnmounted(() => {
               class="field-input"
               style="flex: 1"
               :disabled="isDisabledUser"
-              placeholder="自定义个人 ID（3~24 位字母/数字/_/-，仅可修改一次）"
+              placeholder="自定义个人 ID（3~24 位字母/数字/_/-，每 7 天可改一次）"
             />
             <button
               type="submit"
@@ -2321,7 +2905,7 @@ onUnmounted(() => {
               style="white-space: nowrap"
               :disabled="savingPersonalId || isDisabledUser || !profileIdInput.trim() || profileIdInput.trim() === userPersonalId"
             >
-              {{ savingPersonalId ? "保存中..." : "修改个人 ID（限1次）" }}
+              {{ savingPersonalId ? "保存中..." : "修改个人 ID（7天1次）" }}
             </button>
           </form>
 
@@ -2498,6 +3082,42 @@ onUnmounted(() => {
     </div>
   </div>
 
+  <!-- 公告详情弹窗 -->
+  <div v-if="activeAnnouncement" class="modal-backdrop" @click="activeAnnouncement = null">
+    <div class="modal-box modal-wide" @click.stop>
+      <div class="section-header" style="margin-bottom: 0">
+        <div class="row-gap">
+          <span class="vis-badge public">📢 站点公告</span>
+          <h2 class="section-title" style="font-size: 20px">{{ activeAnnouncement.title }}</h2>
+        </div>
+        <button type="button" class="btn-ghost" @click="activeAnnouncement = null">关闭</button>
+      </div>
+      <div class="card-meta">
+        <span>发布人：{{ activeAnnouncement.author_name }}</span>
+        <span>发布时间：{{ formatTime(activeAnnouncement.created_at) }}</span>
+      </div>
+      <div class="card-text read-body">{{ activeAnnouncement.content }}</div>
+
+      <div v-if="announcements.length > 1" style="margin-top: 8px">
+        <div class="sub-heading">全部历史公告（{{ announcements.length }} 条）</div>
+        <div class="feed-list">
+          <div
+            v-for="a in announcements"
+            :key="a.id"
+            class="moment-card"
+            style="cursor: pointer; padding: 12px 14px"
+            @click="activeAnnouncement = a"
+          >
+            <div class="card-meta">
+              <strong style="color: var(--text-main)">{{ a.title }}</strong>
+              <span>{{ formatTime(a.created_at) }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- 他人个人主页弹窗 -->
   <div v-if="loadingUserProfile || viewingProfile" class="modal-backdrop" @click="viewingProfile = null">
     <div class="modal-box modal-wide" @click.stop>
@@ -2524,7 +3144,6 @@ onUnmounted(() => {
           <button type="button" class="btn-ghost" @click="viewingProfile = null">关闭</button>
         </div>
 
-        <!-- 个人数据统计 + 好友操作栏 -->
         <div class="profile-banner">
           <div class="row-gap" style="gap: 16px">
             <div class="mini-stat">
@@ -2544,7 +3163,20 @@ onUnmounted(() => {
           <div class="row-gap">
             <span v-if="viewingProfile.relation === 'self'" class="tag-chip">这是你自己的主页</span>
             <template v-else-if="viewingProfile.relation === 'friends'">
-              <span class="vis-badge public">✓ 已是好友</span>
+              <button
+                type="button"
+                class="btn-primary"
+                style="padding: 7px 14px; font-size: 13px"
+                @click="
+                  openDirectChat(
+                    viewingProfile.user.id,
+                    viewingProfile.user.username,
+                    viewingProfile.user.uid
+                  )
+                "
+              >
+                💬 发私聊
+              </button>
               <button
                 type="button"
                 class="btn-danger-sm"
@@ -2605,7 +3237,6 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <!-- TA 的公开内容切换 -->
         <div class="modal-tabs">
           <button
             type="button"
