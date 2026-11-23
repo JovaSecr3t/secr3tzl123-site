@@ -2983,7 +2983,7 @@ onUnmounted(() => {
     </main>
 
     <footer class="site-footer">
-      <p>© 2026 Vue 3 + TypeScript + Cloudflare D1 社区</p>
+      <p>© 2026 Secr3tZL Based on Cloudflare+Typescript</p>
     </footer>
 
     <!-- 发布帖子弹窗 -->
