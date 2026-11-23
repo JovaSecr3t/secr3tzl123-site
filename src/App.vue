@@ -9,9 +9,9 @@ type FrontendTab =
   | "moments"
   | "friends"
   | "messages"
-  | "notifications"
-  | "private_space"
   | "profile";
+type MessageSubTab = "dm" | "notifications";
+type ProfileContentTab = "posts" | "notes";
 type AdminSubTab = "users" | "posts" | "announcements";
 type AuthMode = "login" | "register";
 type UserRole = "admin" | "user";
@@ -217,6 +217,8 @@ const PALETTES: PaletteOption[] = [
 ];
 
 const activeTab = ref<FrontendTab>("home");
+const messageSubTab = ref<MessageSubTab>("dm");
+const myContentTab = ref<ProfileContentTab>("posts");
 const isAdminRoute = ref<boolean>(window.location.pathname.replace(/\/+$/, "") === "/admin");
 const theme = ref<ThemeMode>("dark");
 const palette = ref<PaletteKey>("ocean");
@@ -276,7 +278,7 @@ const announcePinned = ref<boolean>(true);
 const publishingAnnounce = ref<boolean>(false);
 const activeAnnouncement = ref<AnnouncementItem | null>(null);
 
-// 站内消息提醒
+// 站内消息提醒（合并在消息/私聊中心）
 const notifications = ref<NotificationItem[]>([]);
 const unreadNotifCount = ref<number>(0);
 const unreadDmCount = ref<number>(0);
@@ -346,6 +348,17 @@ const displayCurrentUser = computed<string>(() =>
   isLoggedIn.value ? userName.value || "用户" : "访客"
 );
 
+// 互动提醒（点赞与评论，排除私聊以免与私聊列表重复）
+const interactionNotifications = computed<NotificationItem[]>(() =>
+  notifications.value.filter((n) => n.type !== "dm")
+);
+const unreadInteractionCount = computed<number>(
+  () => interactionNotifications.value.filter((n) => !n.is_read).length
+);
+const totalMessageBadgeCount = computed<number>(
+  () => unreadDmCount.value + unreadInteractionCount.value
+);
+
 const pinnedAnnouncements = computed<AnnouncementItem[]>(() =>
   announcements.value.filter((a) => a.is_pinned)
 );
@@ -354,13 +367,9 @@ const latestBannerAnnouncement = computed<AnnouncementItem | null>(
 );
 
 const publicPosts = computed<PostItem[]>(() => posts.value.filter((p) => p.is_public));
-const privatePosts = computed<PostItem[]>(() =>
-  posts.value.filter((p) => !p.is_public && p.is_mine)
-);
+const myAllPosts = computed<PostItem[]>(() => posts.value.filter((p) => p.is_mine));
 const publicNotes = computed<NoteItem[]>(() => notes.value.filter((n) => n.is_public));
-const privateNotes = computed<NoteItem[]>(() =>
-  notes.value.filter((n) => !n.is_public && n.is_mine)
-);
+const myAllNotes = computed<NoteItem[]>(() => notes.value.filter((n) => n.is_mine));
 
 const filteredAdminUsers = computed<AdminUserItem[]>(() => {
   const q = adminUserQuery.value.trim().toLowerCase();
@@ -603,6 +612,7 @@ async function openDirectChat(peerId: string, peerName: string, peerUid: number)
   }
   viewingProfile.value = null;
   activeTab.value = "messages";
+  messageSubTab.value = "dm";
   activeChatPeer.value = { id: peerId, uid: peerUid, name: peerName };
   loadingChat.value = true;
   try {
@@ -1106,11 +1116,9 @@ async function handleLogout(): Promise<void> {
   replyTarget.value = null;
   viewingProfile.value = null;
   if (
-    activeTab.value === "private_space" ||
     activeTab.value === "profile" ||
     activeTab.value === "friends" ||
-    activeTab.value === "messages" ||
-    activeTab.value === "notifications"
+    activeTab.value === "messages"
   ) {
     activeTab.value = "home";
   }
@@ -1134,8 +1142,9 @@ async function handlePublishPost(): Promise<void> {
     postTitle.value = "";
     postContent.value = "";
     showPostModal.value = false;
-    activeTab.value = created.is_public ? "community" : "private_space";
-    showNotice(created.is_public ? "已发布到社区" : "已保存到私密空间");
+    activeTab.value = created.is_public ? "community" : "profile";
+    if (!created.is_public) myContentTab.value = "posts";
+    showNotice(created.is_public ? "已发布到社区" : "已保存到个人私密帖子（可在用户中心查看）");
   } catch (err: unknown) {
     showNotice(getErrorMessage(err, "发布失败"));
   } finally {
@@ -1321,7 +1330,7 @@ async function handlePublishNote(): Promise<void> {
     });
     notes.value.unshift(created);
     noteContent.value = "";
-    showNotice(created.is_public ? "已发布公开日常" : "已保存到私密空间");
+    showNotice(created.is_public ? "已发布公开日常" : "已保存私密日常（可在用户中心查看）");
   } catch (err: unknown) {
     showNotice(getErrorMessage(err, "发布失败"));
   } finally {
@@ -1480,11 +1489,10 @@ onMounted(async () => {
   updateClock();
   timer = window.setInterval(updateClock, 1000);
 
-  // 每 12 秒轮询新通知与当前打开的私聊窗口
   pollTimer = window.setInterval(async () => {
     if (!isLoggedIn.value) return;
     await fetchNotifications();
-    if (activeTab.value === "messages" && activeChatPeer.value) {
+    if (activeTab.value === "messages" && messageSubTab.value === "dm" && activeChatPeer.value) {
       const latest = await apiFetch<DirectMessageItem[]>(
         `/api/messages/${encodeURIComponent(activeChatPeer.value.id)}`
       ).catch(() => null);
@@ -1981,23 +1989,10 @@ onUnmounted(() => {
             type="button"
             class="nav-pill"
             :class="{ active: activeTab === 'messages' }"
-            @click="activeTab = 'messages'; fetchConversations()"
+            @click="activeTab = 'messages'; fetchConversations(); fetchNotifications()"
           >
-            💬 私聊
-            <span v-if="unreadDmCount > 0" class="badge-dot">{{ unreadDmCount }}</span>
-          </button>
-          <button
-            v-if="isLoggedIn"
-            type="button"
-            class="nav-pill"
-            :class="{ active: activeTab === 'notifications' }"
-            @click="activeTab = 'notifications'; fetchNotifications()"
-          >
-            🔔 提醒
-            <span v-if="unreadNotifCount > 0" class="badge-dot">{{ unreadNotifCount }}</span>
-          </button>
-          <button type="button" class="nav-pill" :class="{ active: activeTab === 'private_space' }" @click="activeTab = 'private_space'">
-            🔒 私密
+            💬 消息
+            <span v-if="totalMessageBadgeCount > 0" class="badge-dot">{{ totalMessageBadgeCount }}</span>
           </button>
           <button
             v-if="isLoggedIn"
@@ -2006,7 +2001,7 @@ onUnmounted(() => {
             :class="{ active: activeTab === 'profile' }"
             @click="profileNameInput = displayCurrentUser; profileIdInput = userPersonalId; activeTab = 'profile'"
           >
-            用户中心
+            👤 用户中心
           </button>
           <button v-if="isAdmin" type="button" class="nav-pill" @click="goToPath('/admin')">
             🛡️ 后台
@@ -2073,7 +2068,7 @@ onUnmounted(() => {
               <div class="hero-avatar">{{ getInitials(displayCurrentUser) }}</div>
               <div>
                 <h1 class="hero-title">欢迎您，{{ displayCurrentUser }}</h1>
-                <p class="hero-subtitle">社区交流、日常动态、好友私聊与私密空间</p>
+                <p class="hero-subtitle">社区交流、日常动态、好友私聊与个人主页</p>
               </div>
             </div>
             <div class="tag-row">
@@ -2368,7 +2363,7 @@ onUnmounted(() => {
         <div class="section-header">
           <div>
             <h2 class="section-title">日常动态 · Moments</h2>
-            <p class="section-sub">分享短动态，发布时可自由选择公开或仅自己可见</p>
+            <p class="section-sub">分享短动态，发布时可自由选择公开或仅自己可见（私密内容可在用户中心管理）</p>
           </div>
           <span class="card-meta">共 {{ publicNotes.length }} 条公开动态</span>
         </div>
@@ -2641,18 +2636,56 @@ onUnmounted(() => {
         </div>
       </section>
 
-      <!-- 5. 好友私聊 -->
+      <!-- 5. 消息中心（好友私聊 + 点赞/评论互动提醒合并） -->
       <section v-if="activeTab === 'messages' && isLoggedIn" class="glass-card">
         <div class="section-header">
           <div>
-            <h2 class="section-title">💬 好友私聊</h2>
-            <p class="section-sub">仅支持与已互为好友的用户一对一私聊</p>
+            <h2 class="section-title">💬 消息与私聊</h2>
+            <p class="section-sub">好友一对一私聊与收到的评论、回复、点赞提醒</p>
           </div>
-          <button type="button" class="btn-mini" @click="fetchConversations">刷新会话</button>
+          <div class="row-gap">
+            <button
+              v-if="messageSubTab === 'notifications' && unreadNotifCount > 0"
+              type="button"
+              class="btn-mini"
+              @click="handleMarkAllNotificationsRead"
+            >
+              全部标为已读
+            </button>
+            <button
+              type="button"
+              class="btn-mini"
+              @click="fetchConversations(); fetchNotifications()"
+            >
+              刷新
+            </button>
+          </div>
         </div>
 
-        <div class="dm-layout">
-          <!-- 左侧好友会话列表 -->
+        <!-- 私聊 / 互动提醒 子切换 -->
+        <div class="modal-tabs" style="margin-bottom: 16px">
+          <button
+            type="button"
+            class="modal-tab"
+            :class="{ active: messageSubTab === 'dm' }"
+            @click="messageSubTab = 'dm'; fetchConversations()"
+          >
+            💬 好友私聊
+            <span v-if="unreadDmCount > 0" class="badge-dot">{{ unreadDmCount }}</span>
+          </button>
+          <button
+            type="button"
+            class="modal-tab"
+            :class="{ active: messageSubTab === 'notifications' }"
+            @click="messageSubTab = 'notifications'; fetchNotifications()"
+          >
+            🔔 评论与点赞提醒
+            <span v-if="unreadInteractionCount > 0" class="badge-dot">{{ unreadInteractionCount }}</span>
+          </button>
+        </div>
+
+        <!-- 5.1 好友私聊面板 -->
+        <div v-if="messageSubTab === 'dm'" class="dm-layout">
           <div class="dm-sidebar">
             <div v-if="conversations.length === 0" class="empty-state" style="padding: 20px 10px">
               暂无可私聊的好友，先去「👥 好友」添加好友吧~
@@ -2680,7 +2713,6 @@ onUnmounted(() => {
             </button>
           </div>
 
-          <!-- 右侧聊天窗口 -->
           <div class="dm-window">
             <div v-if="!activeChatPeer" class="empty-state" style="margin: auto">
               从左侧选择一位好友开始私聊
@@ -2742,82 +2774,162 @@ onUnmounted(() => {
             </template>
           </div>
         </div>
-      </section>
 
-      <!-- 6. 消息提醒中心 -->
-      <section v-if="activeTab === 'notifications' && isLoggedIn" class="glass-card">
-        <div class="section-header">
-          <div>
-            <h2 class="section-title">🔔 消息提醒中心</h2>
-            <p class="section-sub">收到新评论、回复、点赞与私聊消息都会实时汇总在这里</p>
+        <!-- 5.2 点赞与评论提醒列表 -->
+        <div v-else>
+          <div v-if="loadingNotifications" class="empty-state">加载提醒中...</div>
+          <div v-else-if="interactionNotifications.length === 0" class="empty-state">
+            暂时还没有收到任何评论或点赞提醒~
           </div>
-          <div class="row-gap">
-            <button
-              v-if="unreadNotifCount > 0"
-              type="button"
-              class="btn-mini"
-              @click="handleMarkAllNotificationsRead"
+          <div v-else class="feed-list">
+            <div
+              v-for="item in interactionNotifications"
+              :key="item.id"
+              class="moment-card notif-item"
+              :class="{ unread: !item.is_read }"
+              @click="handleClickNotification(item)"
             >
-              全部标为已读
-            </button>
-            <button type="button" class="btn-mini" @click="fetchNotifications">刷新</button>
-          </div>
-        </div>
-
-        <div v-if="loadingNotifications" class="empty-state">加载提醒中...</div>
-        <div v-else-if="notifications.length === 0" class="empty-state">
-          暂时还没有收到任何提醒~
-        </div>
-        <div v-else class="feed-list">
-          <div
-            v-for="item in notifications"
-            :key="item.id"
-            class="moment-card notif-item"
-            :class="{ unread: !item.is_read }"
-            @click="handleClickNotification(item)"
-          >
-            <div class="card-meta">
-              <div class="row-gap">
-                <span v-if="!item.is_read" class="unread-dot" />
-                <span class="mood-badge">{{ getNotifTypeLabel(item.type) }}</span>
-                <strong>{{ item.actor_name }}</strong>
-                <span v-if="item.actor_uid" class="uid-tag">#{{ item.actor_uid }}</span>
+              <div class="card-meta">
+                <div class="row-gap">
+                  <span v-if="!item.is_read" class="unread-dot" />
+                  <span class="mood-badge">{{ getNotifTypeLabel(item.type) }}</span>
+                  <strong>{{ item.actor_name }}</strong>
+                  <span v-if="item.actor_uid" class="uid-tag">#{{ item.actor_uid }}</span>
+                </div>
+                <span>{{ formatTime(item.created_at) }}</span>
               </div>
-              <span>{{ formatTime(item.created_at) }}</span>
+              <p class="card-text" style="font-size: 14px">{{ item.preview }}</p>
             </div>
-            <p class="card-text" style="font-size: 14px">{{ item.preview }}</p>
           </div>
         </div>
       </section>
 
-      <!-- 7. 私密空间 -->
-      <section v-if="activeTab === 'private_space'" class="glass-card">
-        <div class="section-header">
-          <div>
-            <h2 class="section-title">🔒 我的私密空间</h2>
-            <p class="section-sub">仅你自己登录后可见（包括管理员在内的其他人都看不到），随时可删除或转为公开</p>
+      <!-- 6. 用户中心（账号资料 + 我的全部帖子与私密内容管理） -->
+      <template v-if="activeTab === 'profile' && isLoggedIn">
+        <section class="glass-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">👤 用户中心</h2>
+              <p class="section-sub">管理你的专属 UID、个人 ID（每 7 天可修改 1 次）与显示用户名</p>
+            </div>
+            <div class="row-gap">
+              <button v-if="userId" type="button" class="btn-mini" @click="openUserProfile(userId)">
+                预览我的公开主页
+              </button>
+              <span class="status-badge" :class="userStatus">{{ getStatusLabel(userStatus) }}</span>
+              <span class="vis-badge" :class="isAdmin ? 'public' : 'private'">
+                {{ isAdmin ? "🛡️ 管理员" : "普通用户" }}
+              </span>
+            </div>
           </div>
-          <button v-if="isLoggedIn" type="button" class="btn-primary" @click="openPostModal(false)">
-            ＋ 写一篇私密帖子
-          </button>
-        </div>
 
-        <div v-if="!isLoggedIn" class="notice-bar">
-          <span>请先登录以查看和管理你的私密内容</span>
-          <button type="button" class="btn-primary" @click="openAuthModal('login')">立即登录</button>
-        </div>
+          <div class="composer-form">
+            <div class="copy-row">
+              <span>专属 UID：<span class="uid-tag">#{{ userUid }}</span></span>
+              <button type="button" class="btn-mini" @click="copyText(userUid, '专属 UID')">复制 UID</button>
+            </div>
 
-        <div v-else class="col-gap" style="gap: 24px">
-          <div>
-            <h3 class="sub-heading">私密帖子（{{ privatePosts.length }} 篇）</h3>
-            <div v-if="privatePosts.length === 0" class="empty-state">暂无私密帖子</div>
+            <div class="copy-row">
+              <span>个人 ID：<code class="id-code">{{ userPersonalId }}</code></span>
+              <button type="button" class="btn-mini" @click="copyText(userPersonalId, '个人 ID')">复制 ID</button>
+            </div>
+
+            <div v-if="!canChangePersonalId && nextPersonalIdChangeAt" class="card-meta">
+              ⏳ 个人 ID 每 7 天可修改一次，下次可修改时间：{{ formatTime(nextPersonalIdChangeAt) }}
+            </div>
+            <form v-else class="row-gap" style="margin-top: 2px" @submit.prevent="handleUpdatePersonalId">
+              <input
+                v-model="profileIdInput"
+                type="text"
+                maxlength="24"
+                class="field-input"
+                style="flex: 1"
+                :disabled="isDisabledUser"
+                placeholder="自定义个人 ID（3~24 位字母/数字/_/-，每 7 天可改一次）"
+              />
+              <button
+                type="submit"
+                class="btn-primary"
+                style="white-space: nowrap"
+                :disabled="savingPersonalId || isDisabledUser || !profileIdInput.trim() || profileIdInput.trim() === userPersonalId"
+              >
+                {{ savingPersonalId ? "保存中..." : "修改个人 ID（7天1次）" }}
+              </button>
+            </form>
+
+            <div class="card-meta" style="margin-top: 4px">绑定邮箱：{{ userEmail || "未填写" }}</div>
+
+            <div v-if="userId === 'admin_root'" class="notice-bar">
+              <span>默认管理员 admin 用户名受系统保护，不可修改。</span>
+            </div>
+            <form v-else class="col-gap" style="margin-top: 8px" @submit.prevent="handleUpdateUsername">
+              <input
+                v-model="profileNameInput"
+                type="text"
+                maxlength="20"
+                class="field-input"
+                :disabled="isDisabledUser"
+                placeholder="输入新的用户名（2~20 字，不可重复）"
+              />
+              <div class="flex-end">
+                <button type="submit" class="btn-primary" :disabled="savingProfile || isDisabledUser || !profileNameInput.trim()">
+                  {{ savingProfile ? "保存中..." : "保存用户名" }}
+                </button>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <!-- 我的全部帖子 & 日常（含私密管理） -->
+        <section class="glass-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">📚 我的创作与私密空间</h2>
+              <p class="section-sub">查看你发布过的全部帖子与日常，私密内容仅你自己登录后可见</p>
+            </div>
+            <button type="button" class="btn-primary" @click="openPostModal(false)">
+              ＋ 写一篇私密帖子
+            </button>
+          </div>
+
+          <div class="modal-tabs" style="margin-bottom: 16px">
+            <button
+              type="button"
+              class="modal-tab"
+              :class="{ active: myContentTab === 'posts' }"
+              @click="myContentTab = 'posts'"
+            >
+              我发过的帖子 ({{ myAllPosts.length }})
+            </button>
+            <button
+              type="button"
+              class="modal-tab"
+              :class="{ active: myContentTab === 'notes' }"
+              @click="myContentTab = 'notes'"
+            >
+              我发过的日常 ({{ myAllNotes.length }})
+            </button>
+          </div>
+
+          <!-- 我发过的帖子 -->
+          <div v-if="myContentTab === 'posts'">
+            <div v-if="myAllPosts.length === 0" class="empty-state">
+              你还没有发布过帖子，点击右上角「＋ 发帖」开始创作吧~
+            </div>
             <div v-else class="pyq-feed">
-              <article v-for="post in privatePosts" :key="post.id" class="pyq-item">
-                <div class="pyq-avatar private-av">🔒</div>
+              <article v-for="post in myAllPosts" :key="post.id" class="pyq-item">
+                <div class="pyq-avatar" :class="{ 'private-av': !post.is_public }">
+                  {{ post.is_public ? getInitials(post.author_name) : "🔒" }}
+                </div>
                 <div class="pyq-body">
                   <div class="pyq-top">
-                    <span class="pyq-author">{{ post.author_name }}</span>
-                    <span class="vis-badge private">🔒 仅自己可见</span>
+                    <div class="row-gap">
+                      <span class="pyq-author">{{ post.author_name }}</span>
+                      <span class="card-meta">❤️ {{ post.like_count }} · 💬 {{ post.comment_count }}</span>
+                    </div>
+                    <span class="vis-badge" :class="post.is_public ? 'public' : 'private'">
+                      {{ post.is_public ? "🌐 社区公开" : "🔒 仅自己可见" }}
+                    </span>
                   </div>
                   <h3 class="pyq-title" @click="readingPost = post">{{ post.title }}</h3>
                   <p class="pyq-content clamped">{{ post.content }}</p>
@@ -2825,8 +2937,12 @@ onUnmounted(() => {
                     <span>{{ formatTime(post.created_at) }}</span>
                     <div class="pyq-actions">
                       <button type="button" class="btn-mini" @click="readingPost = post">展开全文</button>
-                      <button type="button" class="btn-mini" @click="handleTogglePostVisibility(post)">转为社区公开</button>
-                      <button type="button" class="btn-danger-sm" @click="handleDeletePost(post.id)">删除</button>
+                      <button type="button" class="btn-mini" @click="handleTogglePostVisibility(post)">
+                        {{ post.is_public ? "设为私密" : "转为社区公开" }}
+                      </button>
+                      <button type="button" class="btn-danger-sm" @click="handleDeletePost(post.id)">
+                        删除
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -2834,103 +2950,36 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div>
-            <h3 class="sub-heading">私密日常（{{ privateNotes.length }} 条）</h3>
-            <div v-if="privateNotes.length === 0" class="empty-state">暂无私密日常</div>
+          <!-- 我发过的日常 -->
+          <div v-else>
+            <div v-if="myAllNotes.length === 0" class="empty-state">
+              你还没有发布过日常动态~
+            </div>
             <div v-else class="feed-list">
-              <div v-for="note in privateNotes" :key="note.id" class="moment-card">
+              <div v-for="note in myAllNotes" :key="note.id" class="moment-card">
                 <div class="card-meta">
                   <div class="row-gap">
-                    <span class="vis-badge private">🔒 私密</span>
+                    <span class="vis-badge" :class="note.is_public ? 'public' : 'private'">
+                      {{ note.is_public ? "🌐 公开" : "🔒 私密" }}
+                    </span>
                     <span class="mood-badge">{{ note.mood || "日常" }}</span>
                   </div>
                   <div class="row-gap">
                     <span>{{ formatTime(note.created_at) }}</span>
-                    <button type="button" class="btn-mini" @click="handleToggleNoteVisibility(note)">转为公开</button>
-                    <button type="button" class="btn-danger-sm" @click="handleDeleteNote(note.id)">删除</button>
+                    <button type="button" class="btn-mini" @click="handleToggleNoteVisibility(note)">
+                      {{ note.is_public ? "设为私密" : "转为公开" }}
+                    </button>
+                    <button type="button" class="btn-danger-sm" @click="handleDeleteNote(note.id)">
+                      删除
+                    </button>
                   </div>
                 </div>
                 <p class="card-text">{{ note.content }}</p>
               </div>
             </div>
           </div>
-        </div>
-      </section>
-
-      <!-- 8. 用户中心 -->
-      <section v-if="activeTab === 'profile' && isLoggedIn" class="glass-card">
-        <div class="section-header">
-          <div>
-            <h2 class="section-title">用户中心</h2>
-            <p class="section-sub">管理你的专属 UID、个人 ID（每 7 天可修改 1 次）与显示用户名</p>
-          </div>
-          <div class="row-gap">
-            <button v-if="userId" type="button" class="btn-mini" @click="openUserProfile(userId)">
-              预览我的公开主页
-            </button>
-            <span class="status-badge" :class="userStatus">{{ getStatusLabel(userStatus) }}</span>
-            <span class="vis-badge" :class="isAdmin ? 'public' : 'private'">
-              {{ isAdmin ? "🛡️ 管理员" : "普通用户" }}
-            </span>
-          </div>
-        </div>
-
-        <div class="composer-form">
-          <div class="copy-row">
-            <span>专属 UID：<span class="uid-tag">#{{ userUid }}</span></span>
-            <button type="button" class="btn-mini" @click="copyText(userUid, '专属 UID')">复制 UID</button>
-          </div>
-
-          <div class="copy-row">
-            <span>个人 ID：<code class="id-code">{{ userPersonalId }}</code></span>
-            <button type="button" class="btn-mini" @click="copyText(userPersonalId, '个人 ID')">复制 ID</button>
-          </div>
-
-          <div v-if="!canChangePersonalId && nextPersonalIdChangeAt" class="card-meta">
-            ⏳ 个人 ID 每 7 天可修改一次，下次可修改时间：{{ formatTime(nextPersonalIdChangeAt) }}
-          </div>
-          <form v-else class="row-gap" style="margin-top: 2px" @submit.prevent="handleUpdatePersonalId">
-            <input
-              v-model="profileIdInput"
-              type="text"
-              maxlength="24"
-              class="field-input"
-              style="flex: 1"
-              :disabled="isDisabledUser"
-              placeholder="自定义个人 ID（3~24 位字母/数字/_/-，每 7 天可改一次）"
-            />
-            <button
-              type="submit"
-              class="btn-primary"
-              style="white-space: nowrap"
-              :disabled="savingPersonalId || isDisabledUser || !profileIdInput.trim() || profileIdInput.trim() === userPersonalId"
-            >
-              {{ savingPersonalId ? "保存中..." : "修改个人 ID（7天1次）" }}
-            </button>
-          </form>
-
-          <div class="card-meta" style="margin-top: 4px">绑定邮箱：{{ userEmail || "未填写" }}</div>
-
-          <div v-if="userId === 'admin_root'" class="notice-bar">
-            <span>默认管理员 admin 用户名受系统保护，不可修改。</span>
-          </div>
-          <form v-else class="col-gap" style="margin-top: 8px" @submit.prevent="handleUpdateUsername">
-            <input
-              v-model="profileNameInput"
-              type="text"
-              maxlength="20"
-              class="field-input"
-              :disabled="isDisabledUser"
-              placeholder="输入新的用户名（2~20 字，不可重复）"
-            />
-            <div class="flex-end">
-              <button type="submit" class="btn-primary" :disabled="savingProfile || isDisabledUser || !profileNameInput.trim()">
-                {{ savingProfile ? "保存中..." : "保存用户名" }}
-              </button>
-            </div>
-          </form>
-        </div>
-      </section>
+        </section>
+      </template>
     </main>
 
     <footer class="site-footer">
@@ -2958,7 +3007,7 @@ onUnmounted(() => {
               </button>
               <button type="button" class="vis-option" :class="{ 'active-private': !postIsPublic }" @click="postIsPublic = false">
                 <span class="vis-option-title">🔒 仅自己可见</span>
-                <span class="vis-option-desc">仅存入「私密空间」，其他人不可见</span>
+                <span class="vis-option-desc">仅存入「用户中心」，其他人不可见</span>
               </button>
             </div>
           </div>
@@ -2966,7 +3015,7 @@ onUnmounted(() => {
           <div class="flex-end">
             <button type="button" class="btn-ghost" @click="showPostModal = false">取消</button>
             <button type="submit" class="btn-primary" :disabled="publishingPost || !postTitle.trim() || !postContent.trim()">
-              {{ publishingPost ? "发布中..." : postIsPublic ? "发布到社区" : "保存到私密空间" }}
+              {{ publishingPost ? "发布中..." : postIsPublic ? "发布到社区" : "保存私密帖子" }}
             </button>
           </div>
         </form>
