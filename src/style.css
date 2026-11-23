@@ -603,7 +603,7 @@ button { cursor: pointer; }
     font-size: 16px;
   }
 
-  /* 顶部导航栏：改为圆角卡片 + 导航项横向滑动，避免挤成一坨 */
+/* 顶部导航栏：窄屏自动换行，保证所有按钮完整展示不被截断 */
   .nav-wrap {
     top: 8px;
     padding: 0 10px;
@@ -625,24 +625,20 @@ button { cursor: pointer; }
   }
 
   .nav-links {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-    padding-bottom: 2px;
+    display: flex;
+    flex-wrap: wrap;
+    overflow-x: visible;
     gap: 6px;
-  }
-  .nav-links::-webkit-scrollbar {
-    display: none;
+    width: 100%;
   }
 
   .nav-pill {
-    flex-shrink: 0;
-    padding: 6px 12px;
+    padding: 6px 11px;
     font-size: 13px;
   }
 
   .nav-actions {
+    flex-wrap: wrap;
     justify-content: space-between;
     gap: 6px;
   }
